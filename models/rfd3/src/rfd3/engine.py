@@ -35,6 +35,7 @@ from rfd3.utils.io import (
     extract_example_id_from_path,
     find_files_with_extension,
 )
+from rfd3.utils.tracing import maybe_sync_cuda, trace_range
 
 logging.basicConfig(level=logging.INFO)
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
@@ -209,22 +210,28 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         n_batches: int | None = None,
         out_dir: str | PathLike | None = None,
     ):
-        self._set_out_dir(out_dir)
-        inputs = self._canonicalize_inputs(inputs)
-        design_specifications = self._multiply_specifications(
-            inputs=inputs,
-            n_batches=n_batches,
-        )
-        if len(design_specifications) == 0:
-            ranked_logger.info("No design specifications to run. Skipping.")
-            return None
-        ensure_inference_sampler_matches_design_spec(
-            design_specifications, self.inference_sampler_overrides
-        )
-        # init before
-        self.initialize()
-        outputs = self._run_multi(design_specifications)
-        return outputs
+        with trace_range("rfd3.engine.run"):
+            self._set_out_dir(out_dir)
+            inputs = self._canonicalize_inputs(inputs)
+            design_specifications = self._multiply_specifications(
+                inputs=inputs,
+                n_batches=n_batches,
+            )
+            if len(design_specifications) == 0:
+                ranked_logger.info("No design specifications to run. Skipping.")
+                return None
+            ensure_inference_sampler_matches_design_spec(
+                design_specifications, self.inference_sampler_overrides
+            )
+
+            with trace_range("rfd3.engine.initialize"):
+                self.initialize()
+            maybe_sync_cuda()
+
+            with trace_range("rfd3.engine.run_multi"):
+                outputs = self._run_multi(design_specifications)
+            maybe_sync_cuda()
+            return outputs
 
     def _set_out_dir(self, out_dir: str | PathLike | None):
         out_dir = Path(out_dir) if out_dir else None
@@ -234,25 +241,21 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         self.out_dir = out_dir
 
     def _run_multi(self, specs) -> None | Dict[str, List[RFD3Output]]:
-        # ==============================================================================
-        # Prepare pipeline and inference loader
-        # ==============================================================================
-        loader = assemble_distributed_inference_loader_from_json(
-            # Passed directly to ContigJSONDataset
-            data=specs,
-            transform=self.pipeline,
-            name="inference-dataset",
-            cif_parser_args=None,
-            subset_to_keys=None,
-            eval_every_n=1,
-            # Sampler args
-            world_size=self.trainer.fabric.world_size,
-            rank=self.trainer.fabric.global_rank,
-        )
-        loader = self.trainer.fabric.setup_dataloaders(
-            loader,
-            use_distributed_sampler=False,
-        )
+        with trace_range("rfd3.engine.loader_setup"):
+            loader = assemble_distributed_inference_loader_from_json(
+                data=specs,
+                transform=self.pipeline,
+                name="inference-dataset",
+                cif_parser_args=None,
+                subset_to_keys=None,
+                eval_every_n=1,
+                world_size=self.trainer.fabric.world_size,
+                rank=self.trainer.fabric.global_rank,
+            )
+            loader = self.trainer.fabric.setup_dataloaders(
+                loader,
+                use_distributed_sampler=False,
+            )
 
         # ==============================================================================
         # Evaluate, using `validation_step`
@@ -263,10 +266,13 @@ class RFD3InferenceEngine(BaseInferenceEngine):
             example_id = pipeline_output["example_id"]
 
             # Run model
-            output_list = self._model_forward(pipeline_output)
+            with trace_range(f"rfd3.engine.batch.{batch_idx}"):
+                output_list = self._model_forward(pipeline_output)
+            maybe_sync_cuda()
             if self.out_dir:
-                for output in output_list:
-                    output.dump(out_dir=self.out_dir)
+                with trace_range(f"rfd3.engine.dump.{batch_idx}"):
+                    for output in output_list:
+                        output.dump(out_dir=self.out_dir)
             else:
                 outputs[example_id] = output_list
         return outputs
@@ -274,13 +280,14 @@ class RFD3InferenceEngine(BaseInferenceEngine):
     def _model_forward(self, pipeline_output) -> List[RFD3Output]:
         # Wraps around the trainer validation step to create atom arrays for saving.
         t0 = time.time()
-        with torch.no_grad():
-            pipeline_output = self.trainer.fabric.to_device(pipeline_output)
-            output_val = self.trainer.validation_step(
-                batch=pipeline_output,
-                batch_idx=0,
-                compute_metrics=False,
-            )
+        with trace_range("rfd3.engine.model_forward"):
+            with torch.no_grad():
+                pipeline_output = self.trainer.fabric.to_device(pipeline_output)
+                output_val = self.trainer.validation_step(
+                    batch=pipeline_output,
+                    batch_idx=0,
+                    compute_metrics=False,
+                )
         t_end = time.time()
 
         # Add additional information to prediction metadata
