@@ -282,12 +282,17 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         t0 = time.time()
         with trace_range("rfd3.engine.model_forward"):
             with torch.no_grad():
-                pipeline_output = self.trainer.fabric.to_device(pipeline_output)
-                output_val = self.trainer.validation_step(
-                    batch=pipeline_output,
-                    batch_idx=0,
-                    compute_metrics=False,
-                )
+                with trace_range("rfd3.engine.model_forward.to_device"):
+                    pipeline_output = self.trainer.fabric.to_device(pipeline_output)
+                maybe_sync_cuda()
+
+                with trace_range("rfd3.engine.model_forward.validation_step"):
+                    output_val = self.trainer.validation_step(
+                        batch=pipeline_output,
+                        batch_idx=0,
+                        compute_metrics=False,
+                    )
+                maybe_sync_cuda()
         t_end = time.time()
 
         # Add additional information to prediction metadata
