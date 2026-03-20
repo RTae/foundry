@@ -161,7 +161,12 @@ class AADesignTrainer(FabricTrainer):
             network_input = self._assemble_network_inputs(example)
 
             # Forward pass (without rollout)
-            network_output = model.forward(input=network_input, n_cycle=n_cycle)
+            with trace_range("rfd3.trainer.training_step.forward"):
+                example_id = str(example.get("example_id", "unknown"))
+                with trace_range(
+                    f"rfd3.trainer.training_step.forward.example_id:{example_id}"
+                ):
+                    network_output = model.forward(input=network_input, n_cycle=n_cycle)
             assert_no_nans(
                 network_output,
                 msg=f"network_output for example_id: {example['example_id']}",
@@ -220,10 +225,16 @@ class AADesignTrainer(FabricTrainer):
             )
 
             with trace_range("rfd3.trainer.validation_step.forward"):
-                network_output = model.forward(
-                    input=network_input,
-                    coord_atom_lvl_to_be_noised=example["coord_atom_lvl_to_be_noised"],
-                )
+                example_id = str(example.get("example_id", "unknown"))
+                with trace_range(
+                    f"rfd3.trainer.validation_step.forward.example_id:{example_id}"
+                ):
+                    network_output = model.forward(
+                        input=network_input,
+                        coord_atom_lvl_to_be_noised=example[
+                            "coord_atom_lvl_to_be_noised"
+                        ],
+                    )
             maybe_sync_cuda()
 
             assert_no_nans(
