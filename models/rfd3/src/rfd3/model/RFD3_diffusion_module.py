@@ -21,6 +21,7 @@ from rfd3.model.layers.encoders import (
     DiffusionTokenEncoder,
 )
 from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
+from rfd3.utils.tracing import trace_range
 
 from foundry.model.layers.blocks import (
     FourierEmbedding,
@@ -189,82 +190,89 @@ class RFD3DiffusionModule(nn.Module):
         Diffusion forward pass with recycling.
         Computes denoised positions given encoded features and noisy coordinates.
         """
-        # ... Collect inputs
-        tok_idx = f["atom_to_token_map"]
-        L = len(tok_idx)
-        I = tok_idx.max() + 1  # Number of tokens
-        f["attn_indices"] = create_attention_indices(
-            X_L=X_noisy_L,
-            f=f,
-            n_attn_keys=self.n_attn_keys,
-            n_attn_seq_neighbours=self.n_attn_seq_neighbours,
-        )
+        with trace_range("rfd3.model.diffusion.forward"):
+            # ... Collect inputs
+            with trace_range("rfd3.model.diffusion.forward.collect_inputs"):
+                tok_idx = f["atom_to_token_map"]
+                L = len(tok_idx)
+                I = tok_idx.max() + 1  # Number of tokens
+                f["attn_indices"] = create_attention_indices(
+                    X_L=X_noisy_L,
+                    f=f,
+                    n_attn_keys=self.n_attn_keys,
+                    n_attn_seq_neighbours=self.n_attn_seq_neighbours,
+                )
 
-        # ... Expand t tensors
-        t_L = t.unsqueeze(-1).expand(-1, L) * (
-            ~f["is_motif_atom_with_fixed_coord"]
-        ).float().unsqueeze(0)
-        t_I = t.unsqueeze(-1).expand(-1, I) * (
-            ~f["is_motif_token_with_fully_fixed_coord"]
-        ).float().unsqueeze(0)
+            # ... Expand t tensors
+            with trace_range("rfd3.model.diffusion.forward.expand_time"):
+                t_L = t.unsqueeze(-1).expand(-1, L) * (
+                    ~f["is_motif_atom_with_fixed_coord"]
+                ).float().unsqueeze(0)
+                t_I = t.unsqueeze(-1).expand(-1, I) * (
+                    ~f["is_motif_token_with_fully_fixed_coord"]
+                ).float().unsqueeze(0)
 
-        # ... Create scaled positions
-        R_L_uniform = self.scale_positions_in(X_noisy_L, t)
-        R_noisy_L = self.scale_positions_in(X_noisy_L, t_L)
+            # ... Create scaled positions
+            with trace_range("rfd3.model.diffusion.forward.scale_positions"):
+                R_L_uniform = self.scale_positions_in(X_noisy_L, t)
+                R_noisy_L = self.scale_positions_in(X_noisy_L, t_L)
 
-        # ... Pool initial representation to sequence level
-        A_I = self.process_a(R_noisy_L, tok_idx=tok_idx)
-        S_I = self.downcast_c(C_L, S_I, tok_idx=tok_idx)
+            # ... Pool initial representation to sequence level
+            with trace_range("rfd3.model.diffusion.forward.pool_to_tokens"):
+                A_I = self.process_a(R_noisy_L, tok_idx=tok_idx)
+                S_I = self.downcast_c(C_L, S_I, tok_idx=tok_idx)
 
-        # ... Add batch-wise features to inputs
-        Q_L = Q_L_init.unsqueeze(0) + self.process_r(R_noisy_L)
-        C_L = C_L.unsqueeze(0) + self.process_time_(t_L, i=0)
-        S_I = S_I.unsqueeze(0) + self.process_time_(t_I, i=1)
-        C_L = C_L + self.process_c(C_L)
+            # ... Add batch-wise features to inputs
+            with trace_range("rfd3.model.diffusion.forward.add_time_features"):
+                Q_L = Q_L_init.unsqueeze(0) + self.process_r(R_noisy_L)
+                C_L = C_L.unsqueeze(0) + self.process_time_(t_L, i=0)
+                S_I = S_I.unsqueeze(0) + self.process_time_(t_I, i=1)
+                C_L = C_L + self.process_c(C_L)
 
-        # ... Run Local-Atom Self Attention and Pool
-        if chunked_pairwise_embedder is not None:
-            # Chunked mode: pass chunked embedder and feature dict
-            Q_L = self.encoder(
-                Q_L,
-                C_L,
-                P_LL=None,
-                indices=f["attn_indices"],
-                f=f,  # Pass feature dict for chunked computation
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-            )
-        else:
-            # Standard mode: use full P_LL
-            Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])
-        A_I = self.downcast_q(Q_L, A_I=A_I, S_I=S_I, tok_idx=tok_idx)
+            # ... Run Local-Atom Self Attention and Pool
+            with trace_range("rfd3.model.diffusion.forward.atom_encoder"):
+                if chunked_pairwise_embedder is not None:
+                    # Chunked mode: pass chunked embedder and feature dict
+                    Q_L = self.encoder(
+                        Q_L,
+                        C_L,
+                        P_LL=None,
+                        indices=f["attn_indices"],
+                        f=f,  # Pass feature dict for chunked computation
+                        chunked_pairwise_embedder=chunked_pairwise_embedder,
+                        initializer_outputs=initializer_outputs,
+                    )
+                else:
+                    # Standard mode: use full P_LL
+                    Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])
+                A_I = self.downcast_q(Q_L, A_I=A_I, S_I=S_I, tok_idx=tok_idx)
 
-        # Debug chunked parameters
+            # ... Run forward with recycling
+            with trace_range("rfd3.model.diffusion.forward.recycle"):
+                recycled_features = self.forward_with_recycle(
+                    n_recycle,
+                    X_noisy_L=X_noisy_L,
+                    R_L_uniform=R_L_uniform,
+                    t_L=t_L,
+                    f=f,
+                    Q_L=Q_L,
+                    C_L=C_L,
+                    P_LL=P_LL,
+                    A_I=A_I,
+                    S_I=S_I,
+                    Z_II=Z_II,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                )
 
-        # ... Run forward with recycling
-        recycled_features = self.forward_with_recycle(
-            n_recycle,
-            X_noisy_L=X_noisy_L,
-            R_L_uniform=R_L_uniform,
-            t_L=t_L,
-            f=f,
-            Q_L=Q_L,
-            C_L=C_L,
-            P_LL=P_LL,
-            A_I=A_I,
-            S_I=S_I,
-            Z_II=Z_II,
-            chunked_pairwise_embedder=chunked_pairwise_embedder,
-            initializer_outputs=initializer_outputs,
-        )
-
-        # ... Collect outputs
-        outputs = {
-            "X_L": recycled_features["X_L"],  # [B, L, 3] denoised positions
-            "sequence_indices_I": recycled_features["sequence_indices_I"],
-            "sequence_logits_I": recycled_features["sequence_logits_I"],
-        }
-        return outputs
+            # ... Collect outputs
+            with trace_range("rfd3.model.diffusion.forward.outputs"):
+                outputs = {
+                    "X_L": recycled_features["X_L"],  # [B, L, 3] denoised positions
+                    "sequence_indices_I": recycled_features["sequence_indices_I"],
+                    "sequence_logits_I": recycled_features["sequence_logits_I"],
+                }
+            return outputs
 
     def forward_with_recycle(
         self,
@@ -289,11 +297,12 @@ class RFD3DiffusionModule(nn.Module):
                     torch.clear_autocast_cache()
 
                 # Run forward
-                recycled_features = self.process_(
-                    D_II_self=recycled_features.get("D_II_self"),
-                    X_L_self=recycled_features.get("X_L"),
-                    **kwargs,
-                )
+                with trace_range(f"rfd3.model.diffusion.recycle.iter_{i}"):
+                    recycled_features = self.process_(
+                        D_II_self=recycled_features.get("D_II_self"),
+                        X_L_self=recycled_features.get("X_L"),
+                        **kwargs,
+                    )
 
         return recycled_features
 
@@ -316,72 +325,75 @@ class RFD3DiffusionModule(nn.Module):
         initializer_outputs=None,
         **_,
     ):
-        # ... Embed token level features with atom level encodings
-        S_I, Z_II = self.diffusion_token_encoder(
-            f=f,
-            R_L=R_L_uniform,
-            D_II_self=D_II_self,
-            S_init_I=S_I,
-            Z_init_II=Z_II,
-            C_L=C_L,
-            P_LL=P_LL,
-        )
+        with trace_range("rfd3.model.diffusion.process"):
+            # ... Embed token level features with atom level encodings
+            with trace_range("rfd3.model.diffusion.process.token_encoder"):
+                S_I, Z_II = self.diffusion_token_encoder(
+                    f=f,
+                    R_L=R_L_uniform,
+                    D_II_self=D_II_self,
+                    S_init_I=S_I,
+                    Z_init_II=Z_II,
+                    C_L=C_L,
+                    P_LL=P_LL,
+                )
 
-        # ... Diffusion transformer
-        A_I = self.diffusion_transformer(
-            A_I,
-            S_I,
-            Z_II,
-            f=f,
-            X_L=(
-                X_noisy_L[..., f["is_ca"], :]
-                if X_L_self is None
-                else X_L_self[..., f["is_ca"], :]
-            ),
-            full=not (os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1"),
-        )
+            # ... Diffusion transformer
+            with trace_range("rfd3.model.diffusion.process.token_transformer"):
+                A_I = self.diffusion_transformer(
+                    A_I,
+                    S_I,
+                    Z_II,
+                    f=f,
+                    X_L=(
+                        X_noisy_L[..., f["is_ca"], :]
+                        if X_L_self is None
+                        else X_L_self[..., f["is_ca"], :]
+                    ),
+                    full=not (os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1"),
+                )
 
-        # ... Decoder readout
-        # Check if using chunked P_LL mode
+            # ... Decoder readout
+            with trace_range("rfd3.model.diffusion.process.decoder"):
+                if chunked_pairwise_embedder is not None:
+                    # Chunked mode: pass embedder and no P_LL
+                    A_I, Q_L, o = self.decoder(
+                        A_I,
+                        S_I,
+                        Z_II,
+                        Q_L,
+                        C_L,
+                        P_LL=None,  # Not used in chunked mode
+                        tok_idx=f["atom_to_token_map"],
+                        indices=f["attn_indices"],
+                        f=f,  # Pass f for chunked computation
+                        chunked_pairwise_embedder=chunked_pairwise_embedder,
+                        initializer_outputs=initializer_outputs,
+                    )
+                else:
+                    # Original mode: use full P_LL
+                    A_I, Q_L, o = self.decoder(
+                        A_I,
+                        S_I,
+                        Z_II,
+                        Q_L,
+                        C_L,
+                        P_LL=P_LL,
+                        tok_idx=f["atom_to_token_map"],
+                        indices=f["attn_indices"],
+                    )
 
-        if chunked_pairwise_embedder is not None:
-            # Chunked mode: pass embedder and no P_LL
-            A_I, Q_L, o = self.decoder(
-                A_I,
-                S_I,
-                Z_II,
-                Q_L,
-                C_L,
-                P_LL=None,  # Not used in chunked mode
-                tok_idx=f["atom_to_token_map"],
-                indices=f["attn_indices"],
-                f=f,  # Pass f for chunked computation
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-            )
-        else:
-            # Original mode: use full P_LL
-            A_I, Q_L, o = self.decoder(
-                A_I,
-                S_I,
-                Z_II,
-                Q_L,
-                C_L,
-                P_LL=P_LL,
-                tok_idx=f["atom_to_token_map"],
-                indices=f["attn_indices"],
-            )
+            # ... Process outputs to positions update
+            with trace_range("rfd3.model.diffusion.process.outputs"):
+                R_update_L = self.to_r_update(Q_L)
+                X_out_L = self.scale_positions_out(R_update_L, X_noisy_L, t_L)
 
-        # ... Process outputs to positions update
-        R_update_L = self.to_r_update(Q_L)
-        X_out_L = self.scale_positions_out(R_update_L, X_noisy_L, t_L)
+                sequence_logits_I, sequence_indices_I = self.sequence_head(A_I=A_I)
+                D_II_self = self.bucketize_fn(X_out_L[..., f["is_ca"], :].detach())
 
-        sequence_logits_I, sequence_indices_I = self.sequence_head(A_I=A_I)
-        D_II_self = self.bucketize_fn(X_out_L[..., f["is_ca"], :].detach())
-
-        return {
-            "X_L": X_out_L,
-            "D_II_self": D_II_self,
-            "sequence_logits_I": sequence_logits_I,
-            "sequence_indices_I": sequence_indices_I,
-        } | o
+            return {
+                "X_L": X_out_L,
+                "D_II_self": D_II_self,
+                "sequence_logits_I": sequence_logits_I,
+                "sequence_indices_I": sequence_indices_I,
+            } | o

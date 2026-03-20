@@ -8,6 +8,7 @@ from rfd3.model.cfg_utils import (
 )
 from rfd3.model.inference_sampler import ConditionalDiffusionSampler
 from rfd3.model.layers.encoders import TokenInitializer
+from rfd3.utils.tracing import trace_range
 from torch import nn
 
 from foundry.utils.ddp import RankedLogger
@@ -74,32 +75,36 @@ class RFD3(nn.Module):
         n_cycle=None,
         **_,
     ) -> dict:
-        initializer_outputs = self.token_initializer(input["f"])
+        with trace_range("rfd3.model.RFD3.forward.token_initializer"):
+            initializer_outputs = self.token_initializer(input["f"])
 
         if self.training:
             # Single denoising step
-            return self.diffusion_module(
-                X_noisy_L=input["X_noisy_L"],
-                t=input["t"],
-                f=input["f"],
-                n_recycle=n_cycle,
-                **initializer_outputs,
-            )  # [D, L, 3]
+            with trace_range("rfd3.model.RFD3.forward.train.diffusion_module"):
+                return self.diffusion_module(
+                    X_noisy_L=input["X_noisy_L"],
+                    t=input["t"],
+                    f=input["f"],
+                    n_recycle=n_cycle,
+                    **initializer_outputs,
+                )  # [D, L, 3]
         else:
             if self.use_classifier_free_guidance:
-                f_ref = strip_f(input["f"], self.cfg_features)
-                ref_initializer_outputs = self.token_initializer(f_ref)
+                with trace_range("rfd3.model.RFD3.forward.eval.cfg_prepare"):
+                    f_ref = strip_f(input["f"], self.cfg_features)
+                    ref_initializer_outputs = self.token_initializer(f_ref)
             else:
                 f_ref = None
                 ref_initializer_outputs = None
 
-            return self.inference_sampler.sample_diffusion_like_af3(
-                f=input["f"],
-                f_ref=f_ref,  # for cfg
-                diffusion_module=self.diffusion_module,
-                diffusion_batch_size=coord_atom_lvl_to_be_noised.shape[0],
-                coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised,
-                # Forwarded as **kwargs:
-                initializer_outputs=initializer_outputs,
-                ref_initializer_outputs=ref_initializer_outputs,  # for cfg
-            )
+            with trace_range("rfd3.model.RFD3.forward.eval.sampler"):
+                return self.inference_sampler.sample_diffusion_like_af3(
+                    f=input["f"],
+                    f_ref=f_ref,  # for cfg
+                    diffusion_module=self.diffusion_module,
+                    diffusion_batch_size=coord_atom_lvl_to_be_noised.shape[0],
+                    coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised,
+                    # Forwarded as **kwargs:
+                    initializer_outputs=initializer_outputs,
+                    ref_initializer_outputs=ref_initializer_outputs,  # for cfg
+                )
