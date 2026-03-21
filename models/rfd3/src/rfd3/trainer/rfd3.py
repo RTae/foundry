@@ -224,18 +224,16 @@ class AADesignTrainer(FabricTrainer):
                 msg=f"network_input for example_id: {example['example_id']}",
             )
 
-            with trace_range("rfd3.trainer.validation_step.forward"):
-                example_id = str(example.get("example_id", "unknown"))
-                with trace_range(
-                    f"rfd3.trainer.validation_step.forward.example_id:{example_id}"
-                ):
-                    network_output = model.forward(
-                        input=network_input,
-                        coord_atom_lvl_to_be_noised=example[
-                            "coord_atom_lvl_to_be_noised"
-                        ],
-                    )
-            maybe_sync_cuda()
+            example_id = str(example.get("example_id", "unknown"))
+            with trace_range(
+                f"rfd3.trainer.validation_step.forward.example_id:{example_id}"
+            ):
+                network_output = model.forward(
+                    input=network_input,
+                    coord_atom_lvl_to_be_noised=example[
+                        "coord_atom_lvl_to_be_noised"
+                    ],
+                )
 
             assert_no_nans(
                 network_output,

@@ -261,18 +261,15 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         # Evaluate, using `validation_step`
         # ==============================================================================
         outputs = {}
-        for batch_idx, batch in enumerate(loader):
+        for _, batch in enumerate(loader):
             pipeline_output = batch[0]
             example_id = pipeline_output["example_id"]
 
             # Run model
-            with trace_range(f"rfd3.engine.batch.{batch_idx}"):
-                output_list = self._model_forward(pipeline_output)
-            maybe_sync_cuda()
+            output_list = self._model_forward(pipeline_output)
             if self.out_dir:
-                with trace_range(f"rfd3.engine.dump.{batch_idx}"):
-                    for output in output_list:
-                        output.dump(out_dir=self.out_dir)
+                for output in output_list:
+                    output.dump(out_dir=self.out_dir)
             else:
                 outputs[example_id] = output_list
         return outputs
@@ -280,19 +277,14 @@ class RFD3InferenceEngine(BaseInferenceEngine):
     def _model_forward(self, pipeline_output) -> List[RFD3Output]:
         # Wraps around the trainer validation step to create atom arrays for saving.
         t0 = time.time()
-        with trace_range("rfd3.engine.model_forward"):
-            with torch.no_grad():
-                with trace_range("rfd3.engine.model_forward.to_device"):
-                    pipeline_output = self.trainer.fabric.to_device(pipeline_output)
-                maybe_sync_cuda()
+        with torch.no_grad():
+            pipeline_output = self.trainer.fabric.to_device(pipeline_output)
 
-                with trace_range("rfd3.engine.model_forward.validation_step"):
-                    output_val = self.trainer.validation_step(
-                        batch=pipeline_output,
-                        batch_idx=0,
-                        compute_metrics=False,
-                    )
-                maybe_sync_cuda()
+            output_val = self.trainer.validation_step(
+                batch=pipeline_output,
+                batch_idx=0,
+                compute_metrics=False,
+            )
         t_end = time.time()
 
         # Add additional information to prediction metadata
