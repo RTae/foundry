@@ -188,158 +188,154 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
         threshold_step = (len(noise_schedule) - 1) * self.fraction_of_steps_to_fix_motif
 
-        with trace_range("rfd3.model.inference_sampler.default.rollout"):
-            for step_num, (c_t_minus_1, c_t) in enumerate(
-                zip(noise_schedule, noise_schedule[1:])
+        for step_num, (c_t_minus_1, c_t) in enumerate(
+            zip(noise_schedule, noise_schedule[1:])
+        ):
+            with trace_range(
+                f"rfd3.model.inference_sampler.default.step_{step_num + 1:03d}_of_{total_steps:03d}"
             ):
-                with trace_range(
-                    f"rfd3.model.inference_sampler.default.step_{step_num + 1:03d}_of_{total_steps:03d}"
+                # Assert no grads on X_L
+                assert (
+                    not torch.is_grad_enabled()
+                ), "Computation graph should not be active"
+                assert not X_L.requires_grad, "X_L should not require gradients"
+
+                # Apply a random rotation and translation to the structure
+                if self.allow_realignment:
+                    X_L, _ = centre_random_augment_around_motif(
+                        X_L,
+                        coord_atom_lvl_to_be_noised,
+                        is_motif_atom_with_fixed_coord,
+                        center_option=self.center_option,
+                        # If centering_affects_motif is True, the model's predictions from (step_num-1) might affect the motif
+                        centering_affects_motif=(max(step_num - 1, 0))
+                        >= threshold_step,
+                        # If keeping the motif position wrt the origin fixed, we can't do translational augmentation
+                        # We want to keep this position fixed in the interval where the model is not allowed to change it
+                        s_trans=self.s_trans if step_num >= threshold_step else 0.0,
+                    )
+
+                # Update gamma & step scale
+                gamma = self.gamma_0 if c_t > self.gamma_min else 0
+                step_scale = self.step_scale
+
+                # Compute the value of t_hat
+                t_hat = c_t_minus_1 * (gamma + 1)
+
+                # Noise the coordinates with scaled Gaussian noise
+                epsilon_L = (
+                    self.noise_scale
+                    * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
+                    * torch.normal(
+                        mean=0.0, std=1.0, size=X_L.shape, device=X_L.device
+                    )
+                )
+                epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
+                    0  # No noise injection for fixed atoms
+                )
+                X_noisy_L = X_L + epsilon_L
+
+                # Denoise the coordinates
+                # Handle chunked mode vs standard mode
+                if "chunked_pairwise_embedder" in initializer_outputs:
+                    # Chunked mode: explicitly provide P_LL=None
+                    tic = time.time()
+                    chunked_embedder = initializer_outputs[
+                        "chunked_pairwise_embedder"
+                    ]  # Don't pop, just get
+                    other_outputs = {
+                        k: v
+                        for k, v in initializer_outputs.items()
+                        if k != "chunked_pairwise_embedder"
+                    }
+                    outs = diffusion_module(
+                        X_noisy_L=X_noisy_L,
+                        t=t_hat.tile(D),
+                        f=f,
+                        P_LL=None,  # Not used in chunked mode
+                        chunked_pairwise_embedder=chunked_embedder,
+                        initializer_outputs=other_outputs,
+                        **other_outputs,
+                    )
+                    toc = time.time()
+                    ranked_logger.info(
+                        f"[chunked] step {step_num}: {(toc - tic)*1000:.1f} ms"
+                    )
+                else:
+                    # Standard mode: P_LL is included in initializer_outputs
+                    outs = diffusion_module(
+                        X_noisy_L=X_noisy_L,
+                        t=t_hat.tile(D),
+                        f=f,
+                        **initializer_outputs,
+                    )
+
+                X_denoised_L = outs["X_L"] if "X_L" in outs else outs
+
+                # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
+                delta_L = (
+                    X_noisy_L - X_denoised_L
+                ) / t_hat  # gradient of x wrt. t at x_t_hat
+                d_t = c_t - t_hat
+
+                if self.use_classifier_free_guidance and (
+                    self.cfg_t_max is None or c_t > self.cfg_t_max
                 ):
-                    # Assert no grads on X_L
-                    assert (
-                        not torch.is_grad_enabled()
-                    ), "Computation graph should not be active"
-                    assert not X_L.requires_grad, "X_L should not require gradients"
+                    X_noisy_L_stripped = strip_X(X_noisy_L, f_ref)
 
-                    # Apply a random rotation and translation to the structure
-                    if self.allow_realignment:
-                        X_L, _ = centre_random_augment_around_motif(
-                            X_L,
-                            coord_atom_lvl_to_be_noised,
-                            is_motif_atom_with_fixed_coord,
-                            center_option=self.center_option,
-                            # If centering_affects_motif is True, the model's predictions from (step_num-1) might affect the motif
-                            centering_affects_motif=(max(step_num - 1, 0))
-                            >= threshold_step,
-                            # If keeping the motif position wrt the origin fixed, we can't do translational augmentation
-                            # We want to keep this position fixed in the interval where the model is not allowed to change it
-                            s_trans=self.s_trans if step_num >= threshold_step else 0.0,
-                        )
-
-                    # Update gamma & step scale
-                    gamma = self.gamma_0 if c_t > self.gamma_min else 0
-                    step_scale = self.step_scale
-
-                    # Compute the value of t_hat
-                    t_hat = c_t_minus_1 * (gamma + 1)
-
-                    # Noise the coordinates with scaled Gaussian noise
-                    epsilon_L = (
-                        self.noise_scale
-                        * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
-                        * torch.normal(
-                            mean=0.0, std=1.0, size=X_L.shape, device=X_L.device
-                        )
+                    # unconditional forward pass
+                    outs_ref = diffusion_module(
+                        X_noisy_L=X_noisy_L_stripped,  # modify X
+                        t=t_hat.tile(D),
+                        f=f_ref,  # modified f
+                        **ref_initializer_outputs,
                     )
-                    epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
-                        0  # No noise injection for fixed atoms
-                    )
-                    X_noisy_L = X_L + epsilon_L
 
-                    # Denoise the coordinates
-                    # Handle chunked mode vs standard mode
-                    with trace_range(
-                        "rfd3.model.inference_sampler.default.step.denoise"
-                    ):
-                        if "chunked_pairwise_embedder" in initializer_outputs:
-                            # Chunked mode: explicitly provide P_LL=None
-                            tic = time.time()
-                            chunked_embedder = initializer_outputs[
-                                "chunked_pairwise_embedder"
-                            ]  # Don't pop, just get
-                            other_outputs = {
-                                k: v
-                                for k, v in initializer_outputs.items()
-                                if k != "chunked_pairwise_embedder"
-                            }
-                            outs = diffusion_module(
-                                X_noisy_L=X_noisy_L,
-                                t=t_hat.tile(D),
-                                f=f,
-                                P_LL=None,  # Not used in chunked mode
-                                chunked_pairwise_embedder=chunked_embedder,
-                                initializer_outputs=other_outputs,
-                                **other_outputs,
-                            )
-                            toc = time.time()
-                            ranked_logger.info(
-                                f"[chunked] step {step_num}: {(toc - tic)*1000:.1f} ms"
-                            )
-                        else:
-                            # Standard mode: P_LL is included in initializer_outputs
-                            outs = diffusion_module(
-                                X_noisy_L=X_noisy_L,
-                                t=t_hat.tile(D),
-                                f=f,
-                                **initializer_outputs,
-                            )
+                    X_denoised_L_stripped = outs_ref["X_L"]
 
-                    X_denoised_L = outs["X_L"] if "X_L" in outs else outs
-
-                    # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
-                    delta_L = (
-                        X_noisy_L - X_denoised_L
+                    delta_L_ref = (
+                        X_noisy_L_stripped - X_denoised_L_stripped
                     ) / t_hat  # gradient of x wrt. t at x_t_hat
-                    d_t = c_t - t_hat
 
-                    if self.use_classifier_free_guidance and (
-                        self.cfg_t_max is None or c_t > self.cfg_t_max
-                    ):
-                        X_noisy_L_stripped = strip_X(X_noisy_L, f_ref)
-
-                        # unconditional forward pass
-                        outs_ref = diffusion_module(
-                            X_noisy_L=X_noisy_L_stripped,  # modify X
-                            t=t_hat.tile(D),
-                            f=f_ref,  # modified f
-                            **ref_initializer_outputs,
+                    # pad delta_L_ref with zeros to match delta_L (for the unindexed atoms)
+                    if delta_L_ref.shape[1] < delta_L.shape[1]:
+                        delta_L_ref = torch.cat(
+                            [
+                                delta_L_ref,
+                                torch.zeros_like(
+                                    delta_L[:, delta_L_ref.shape[1] :, :]
+                                ),
+                            ],
+                            dim=1,
                         )
 
-                        X_denoised_L_stripped = outs_ref["X_L"]
+                    # apply CFG
+                    delta_L = delta_L + (self.cfg_scale - 1) * (
+                        delta_L - delta_L_ref
+                    )
 
-                        delta_L_ref = (
-                            X_noisy_L_stripped - X_denoised_L_stripped
-                        ) / t_hat  # gradient of x wrt. t at x_t_hat
+                if exists(outs.get("sequence_logits_I")):
+                    # Compute confidence
+                    p = torch.softmax(
+                        outs["sequence_logits_I"], dim=-1
+                    ).cpu()  # shape (D, L, 32)
+                    seq_entropy = -torch.sum(
+                        p * torch.log(p + 1e-10), dim=-1
+                    )  # shape (D, L,)
+                    sequence_entropy_traj.append(seq_entropy)
 
-                        # pad delta_L_ref with zeros to match delta_L (for the unindexed atoms)
-                        if delta_L_ref.shape[1] < delta_L.shape[1]:
-                            delta_L_ref = torch.cat(
-                                [
-                                    delta_L_ref,
-                                    torch.zeros_like(
-                                        delta_L[:, delta_L_ref.shape[1] :, :]
-                                    ),
-                                ],
-                                dim=1,
-                            )
+                # Update the coordinates, scaled by the step size
+                X_L = X_noisy_L + step_scale * d_t * delta_L
 
-                        # apply CFG
-                        delta_L = delta_L + (self.cfg_scale - 1) * (
-                            delta_L - delta_L_ref
-                        )
-
-                    if exists(outs.get("sequence_logits_I")):
-                        # Compute confidence
-                        p = torch.softmax(
-                            outs["sequence_logits_I"], dim=-1
-                        ).cpu()  # shape (D, L, 32)
-                        seq_entropy = -torch.sum(
-                            p * torch.log(p + 1e-10), dim=-1
-                        )  # shape (D, L,)
-                        sequence_entropy_traj.append(seq_entropy)
-
-                    # Update the coordinates, scaled by the step size
-                    X_L = X_noisy_L + step_scale * d_t * delta_L
-
-                    # Append the results to the trajectory (for visualization of the diffusion process)
-                    X_noisy_L_scaled = (
-                        self.sigma_data
-                        * X_noisy_L
-                        / torch.sqrt(t_hat**2 + self.sigma_data**2)
-                    )  # Save noisy traj as scaled inputs
-                    X_noisy_L_traj.append(X_noisy_L_scaled)
-                    X_denoised_L_traj.append(X_denoised_L)
-                    t_hats.append(t_hat)
+                # Append the results to the trajectory (for visualization of the diffusion process)
+                X_noisy_L_scaled = (
+                    self.sigma_data
+                    * X_noisy_L
+                    / torch.sqrt(t_hat**2 + self.sigma_data**2)
+                )  # Save noisy traj as scaled inputs
+                X_noisy_L_traj.append(X_noisy_L_scaled)
+                X_denoised_L_traj.append(X_denoised_L)
+                t_hats.append(t_hat)
 
         if torch.any(is_motif_atom_with_fixed_coord) and self.allow_realignment:
             # Insert the gt motif at the end
@@ -440,124 +436,121 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
         ranked_logger.info(f"gamma_min_sym: {gamma_min_sym}")
         ranked_logger.info(f"gamma_min: {self.gamma_min}")
-        with trace_range("rfd3.model.inference_sampler.symmetry.rollout"):
-            for step_num, (c_t_minus_1, c_t) in enumerate(
-                zip(noise_schedule, noise_schedule[1:])
+        for step_num, (c_t_minus_1, c_t) in enumerate(
+            zip(noise_schedule, noise_schedule[1:])
+        ):
+            with trace_range(
+                f"rfd3.model.inference_sampler.symmetry.step_{step_num + 1:03d}_of_{total_steps:03d}"
             ):
-                with trace_range(
-                    f"rfd3.model.inference_sampler.symmetry.step_{step_num + 1:03d}_of_{total_steps:03d}"
-                ):
-                    # Assert no grads on X_L
-                    assert (
-                        not torch.is_grad_enabled()
-                    ), "Computation graph should not be active"
-                    assert not X_L.requires_grad, "X_L should not require gradients"
+                # Assert no grads on X_L
+                assert (
+                    not torch.is_grad_enabled()
+                ), "Computation graph should not be active"
+                assert not X_L.requires_grad, "X_L should not require gradients"
 
-                    # Apply a random rotation and translation to the structure
-                    if self.allow_realignment:
-                        X_L, R = centre_random_augment_around_motif(
-                            X_L,
-                            coord_atom_lvl_to_be_noised,
-                            is_motif_atom_with_fixed_coord,
-                        )
-
-                    # Update gamma & step scale
-                    gamma = self.gamma_0 if c_t > self.gamma_min else 0
-                    step_scale = self.step_scale
-
-                    # Compute the value of t_hat
-                    t_hat = c_t_minus_1 * (gamma + 1)
-
-                    # Noise the coordinates with scaled Gaussian noise
-                    epsilon_L = (
-                        self.noise_scale
-                        * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
-                        * torch.normal(
-                            mean=0.0, std=1.0, size=X_L.shape, device=X_L.device
-                        )
-                    )
-                    epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
-                        0  # No noise injection for fixed atoms
+                # Apply a random rotation and translation to the structure
+                if self.allow_realignment:
+                    X_L, R = centre_random_augment_around_motif(
+                        X_L,
+                        coord_atom_lvl_to_be_noised,
+                        is_motif_atom_with_fixed_coord,
                     )
 
-                    # NOTE: no symmetry applied to the noisy structure
-                    X_noisy_L = X_L + epsilon_L
+                # Update gamma & step scale
+                gamma = self.gamma_0 if c_t > self.gamma_min else 0
+                step_scale = self.step_scale
 
-                    # Denoise the coordinates
-                    # Handle chunked mode vs standard mode (same as default sampler)
-                    with trace_range(
-                        "rfd3.model.inference_sampler.symmetry.step.denoise"
-                    ):
-                        if "chunked_pairwise_embedder" in initializer_outputs:
-                            # Chunked mode: explicitly provide P_LL=None
-                            tic = time.time()
-                            chunked_embedder = initializer_outputs[
-                                "chunked_pairwise_embedder"
-                            ]  # Don't pop, just get
-                            other_outputs = {
-                                k: v
-                                for k, v in initializer_outputs.items()
-                                if k != "chunked_pairwise_embedder"
-                            }
-                            outs = diffusion_module(
-                                X_noisy_L=X_noisy_L,
-                                t=t_hat.tile(D),
-                                f=f,
-                                P_LL=None,  # Not used in chunked mode
-                                chunked_pairwise_embedder=chunked_embedder,
-                                initializer_outputs=other_outputs,
-                                **other_outputs,
-                            )
-                            toc = time.time()
-                            ranked_logger.info(
-                                f"[chunked] step {step_num}: {(toc - tic)*1000:.1f} ms"
-                            )
-                        else:
-                            # Standard mode: P_LL is included in initializer_outputs
-                            outs = diffusion_module(
-                                X_noisy_L=X_noisy_L,
-                                t=t_hat.tile(D),
-                                f=f,
-                                **initializer_outputs,
-                            )
-                    # apply symmetry to X_denoised_L
-                    if "X_L" in outs and c_t > gamma_min_sym:
-                        # outs["original_X_L"] = outs["X_L"].clone()
-                        outs["X_L"] = self.apply_symmetry_to_X_L(outs["X_L"], f)
+                # Compute the value of t_hat
+                t_hat = c_t_minus_1 * (gamma + 1)
 
-                    X_denoised_L = outs["X_L"] if "X_L" in outs else outs
+                # Noise the coordinates with scaled Gaussian noise
+                epsilon_L = (
+                    self.noise_scale
+                    * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
+                    * torch.normal(
+                        mean=0.0, std=1.0, size=X_L.shape, device=X_L.device
+                    )
+                )
+                epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
+                    0  # No noise injection for fixed atoms
+                )
 
-                    # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
-                    delta_L = (
-                        X_noisy_L - X_denoised_L
-                    ) / t_hat  # gradient of x wrt. t at x_t_hat
-                    d_t = c_t - t_hat
+                # NOTE: no symmetry applied to the noisy structure
+                X_noisy_L = X_L + epsilon_L
 
-                    # NOTE: no classifier-free guidance for symmetry
+                # Denoise the coordinates
+                # Handle chunked mode vs standard mode (same as default sampler)
+                if "chunked_pairwise_embedder" in initializer_outputs:
+                    # Chunked mode: explicitly provide P_LL=None
+                    tic = time.time()
+                    chunked_embedder = initializer_outputs[
+                        "chunked_pairwise_embedder"
+                    ]  # Don't pop, just get
+                    other_outputs = {
+                        k: v
+                        for k, v in initializer_outputs.items()
+                        if k != "chunked_pairwise_embedder"
+                    }
+                    outs = diffusion_module(
+                        X_noisy_L=X_noisy_L,
+                        t=t_hat.tile(D),
+                        f=f,
+                        P_LL=None,  # Not used in chunked mode
+                        chunked_pairwise_embedder=chunked_embedder,
+                        initializer_outputs=other_outputs,
+                        **other_outputs,
+                    )
+                    toc = time.time()
+                    ranked_logger.info(
+                        f"[chunked] step {step_num}: {(toc - tic)*1000:.1f} ms"
+                    )
+                else:
+                    # Standard mode: P_LL is included in initializer_outputs
+                    outs = diffusion_module(
+                        X_noisy_L=X_noisy_L,
+                        t=t_hat.tile(D),
+                        f=f,
+                        **initializer_outputs,
+                    )
+                    
+                # apply symmetry to X_denoised_L
+                if "X_L" in outs and c_t > gamma_min_sym:
+                    # outs["original_X_L"] = outs["X_L"].clone()
+                    outs["X_L"] = self.apply_symmetry_to_X_L(outs["X_L"], f)
 
-                    if exists(outs.get("sequence_logits_I")):
-                        # Compute confidence
-                        p = torch.softmax(
-                            outs["sequence_logits_I"], dim=-1
-                        ).cpu()  # shape (D, L, 32)
-                        seq_entropy = -torch.sum(
-                            p * torch.log(p + 1e-10), dim=-1
-                        )  # shape (D, L,)
-                        sequence_entropy_traj.append(seq_entropy)
+                X_denoised_L = outs["X_L"] if "X_L" in outs else outs
 
-                    # Update the coordinates, scaled by the step size
-                    # delta_L should be symmetric
-                    X_L = X_noisy_L + step_scale * d_t * delta_L
+                # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
+                delta_L = (
+                    X_noisy_L - X_denoised_L
+                ) / t_hat  # gradient of x wrt. t at x_t_hat
+                d_t = c_t - t_hat
 
-                    # Append the results to the trajectory (for visualization of the diffusion process)
-                    X_noisy_L_scaled = (
-                        self.sigma_data
-                        * X_noisy_L
-                        / torch.sqrt(t_hat**2 + self.sigma_data**2)
-                    )  # Save noisy traj as scaled inputs
-                    X_noisy_L_traj.append(X_noisy_L_scaled)
-                    X_denoised_L_traj.append(X_denoised_L)
-                    t_hats.append(t_hat)
+                # NOTE: no classifier-free guidance for symmetry
+
+                if exists(outs.get("sequence_logits_I")):
+                    # Compute confidence
+                    p = torch.softmax(
+                        outs["sequence_logits_I"], dim=-1
+                    ).cpu()  # shape (D, L, 32)
+                    seq_entropy = -torch.sum(
+                        p * torch.log(p + 1e-10), dim=-1
+                    )  # shape (D, L,)
+                    sequence_entropy_traj.append(seq_entropy)
+
+                # Update the coordinates, scaled by the step size
+                # delta_L should be symmetric
+                X_L = X_noisy_L + step_scale * d_t * delta_L
+
+                # Append the results to the trajectory (for visualization of the diffusion process)
+                X_noisy_L_scaled = (
+                    self.sigma_data
+                    * X_noisy_L
+                    / torch.sqrt(t_hat**2 + self.sigma_data**2)
+                )  # Save noisy traj as scaled inputs
+                X_noisy_L_traj.append(X_noisy_L_scaled)
+                X_denoised_L_traj.append(X_denoised_L)
+                t_hats.append(t_hat)
 
         if torch.any(is_motif_atom_with_fixed_coord) and self.allow_realignment:
             # Insert the gt motif at the end
