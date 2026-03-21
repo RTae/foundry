@@ -97,14 +97,13 @@ class RFD3(nn.Module):
                 f_ref = None
                 ref_initializer_outputs = None
 
-            with trace_range("rfd3.model.RFD3.forward.eval.sampler"):
-                return self.inference_sampler.sample_diffusion_like_af3(
-                    f=input["f"],
-                    f_ref=f_ref,  # for cfg
-                    diffusion_module=self.diffusion_module,
-                    diffusion_batch_size=coord_atom_lvl_to_be_noised.shape[0],
-                    coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised,
-                    # Forwarded as **kwargs:
-                    initializer_outputs=initializer_outputs,
-                    ref_initializer_outputs=ref_initializer_outputs,  # for cfg
-                )
+            return self.inference_sampler.sample_diffusion_like_af3(
+                f=input["f"],
+                f_ref=f_ref,  # for cfg
+                diffusion_module=self.diffusion_module,
+                diffusion_batch_size=coord_atom_lvl_to_be_noised.shape[0],
+                coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised,
+                # Forwarded as **kwargs:
+                initializer_outputs=initializer_outputs,
+                ref_initializer_outputs=ref_initializer_outputs,  # for cfg
+            )
