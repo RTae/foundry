@@ -212,80 +212,79 @@ class AADesignTrainer(FabricTrainer):
         model = self.state["model"]
         assert not model.training, "Model must be in evaluation mode during validation!"
 
-        with trace_range("rfd3.trainer.validation_step"):
-            with trace_range("rfd3.trainer.validation_step.unpack_batch"):
-                example = batch[0] if not isinstance(batch, dict) else batch
+        with trace_range("rfd3.trainer.validation_step.unpack_batch"):
+            example = batch[0] if not isinstance(batch, dict) else batch
 
-            with trace_range("rfd3.trainer.validation_step.assemble_inputs"):
-                network_input = self._assemble_network_inputs(example)
+        with trace_range("rfd3.trainer.validation_step.assemble_inputs"):
+            network_input = self._assemble_network_inputs(example)
 
-            assert_no_nans(
-                network_input,
-                msg=f"network_input for example_id: {example['example_id']}",
+        assert_no_nans(
+            network_input,
+            msg=f"network_input for example_id: {example['example_id']}",
+        )
+
+        example_id = str(example.get("example_id", "unknown"))
+        with trace_range(
+            f"rfd3.trainer.validation_step.forward.example_id:{example_id}"
+        ):
+            network_output = model.forward(
+                input=network_input,
+                coord_atom_lvl_to_be_noised=example[
+                    "coord_atom_lvl_to_be_noised"
+                ],
             )
 
-            example_id = str(example.get("example_id", "unknown"))
-            with trace_range(
-                f"rfd3.trainer.validation_step.forward.example_id:{example_id}"
-            ):
-                network_output = model.forward(
-                    input=network_input,
-                    coord_atom_lvl_to_be_noised=example[
-                        "coord_atom_lvl_to_be_noised"
-                    ],
-                )
+        assert_no_nans(
+            network_output,
+            msg=f"network_output for example_id: {example['example_id']}",
+        )
 
-            assert_no_nans(
-                network_output,
-                msg=f"network_output for example_id: {example['example_id']}",
+        with trace_range("rfd3.trainer.validation_step.build_outputs"):
+            predicted_atom_array_stack, prediction_metadata = (
+                self._build_predicted_atom_array_stack(network_output, example)
             )
 
-            with trace_range("rfd3.trainer.validation_step.build_outputs"):
-                predicted_atom_array_stack, prediction_metadata = (
-                    self._build_predicted_atom_array_stack(network_output, example)
+        metrics_output = {}
+        if compute_metrics:
+            assert self.metrics is not None, "Metrics are not defined!"
+
+            with trace_range("rfd3.trainer.validation_step.metrics_prep"):
+                metrics_extra_info = self._assemble_metrics_extra_info(
+                    example, network_output
                 )
 
-            metrics_output = {}
-            if compute_metrics:
-                assert self.metrics is not None, "Metrics are not defined!"
+            with trace_range("rfd3.trainer.validation_step.metrics_compute"):
+                metrics_output = self.metrics(
+                    network_input=network_input,
+                    network_output=network_output,
+                    extra_info=metrics_extra_info,
+                    # (Uses the permuted ground truth after symmetry resolution)
+                    ground_truth_atom_array_stack=build_stack_from_atom_array_and_batched_coords(
+                        metrics_extra_info["X_gt_L"], example.get("atom_array", None)
+                    ),
+                    predicted_atom_array_stack=predicted_atom_array_stack,
+                    prediction_metadata=prediction_metadata,
+                )
+            maybe_sync_cuda()
 
-                with trace_range("rfd3.trainer.validation_step.metrics_prep"):
-                    metrics_extra_info = self._assemble_metrics_extra_info(
-                        example, network_output
+            if "X_gt_index_to_X" in metrics_extra_info:
+                mapping = metrics_extra_info["X_gt_index_to_X"]  # [D, L]
+                with trace_range("rfd3.trainer.validation_step.remap_outputs"):
+                    network_output["X_L"] = _remap_outputs(
+                        network_output["X_L"], mapping
                     )
 
-                with trace_range("rfd3.trainer.validation_step.metrics_compute"):
-                    metrics_output = self.metrics(
-                        network_input=network_input,
-                        network_output=network_output,
-                        extra_info=metrics_extra_info,
-                        # (Uses the permuted ground truth after symmetry resolution)
-                        ground_truth_atom_array_stack=build_stack_from_atom_array_and_batched_coords(
-                            metrics_extra_info["X_gt_L"], example.get("atom_array", None)
-                        ),
-                        predicted_atom_array_stack=predicted_atom_array_stack,
-                        prediction_metadata=prediction_metadata,
+            if metrics_output is not None:
+                with trace_range("rfd3.trainer.validation_step.detach_metrics"):
+                    metrics_output = apply_to_collection(
+                        metrics_output, torch.Tensor, lambda x: x.detach()
                     )
-                maybe_sync_cuda()
 
-                if "X_gt_index_to_X" in metrics_extra_info:
-                    mapping = metrics_extra_info["X_gt_index_to_X"]  # [D, L]
-                    with trace_range("rfd3.trainer.validation_step.remap_outputs"):
-                        network_output["X_L"] = _remap_outputs(
-                            network_output["X_L"], mapping
-                        )
-
-                if metrics_output is not None:
-                    with trace_range("rfd3.trainer.validation_step.detach_metrics"):
-                        metrics_output = apply_to_collection(
-                            metrics_output, torch.Tensor, lambda x: x.detach()
-                        )
-
-            if network_output is not None:
-                with trace_range("rfd3.trainer.validation_step.detach_network_output"):
-                    network_output = apply_to_collection(
-                        network_output, torch.Tensor, lambda x: x.detach()
-                    )
+        if network_output is not None:
+            with trace_range("rfd3.trainer.validation_step.detach_network_output"):
+                network_output = apply_to_collection(
+                    network_output, torch.Tensor, lambda x: x.detach()
+                )
 
         return {
             "metrics_output": metrics_output,
