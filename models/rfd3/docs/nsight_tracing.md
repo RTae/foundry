@@ -86,6 +86,34 @@ The script uses the same Nsight flags as canonical docs by default:
 - --trace=cuda,nvtx,osrt,cublas,cudnn
 - --cuda-memory-usage=true
 
+Low-memory mode from CLI config override (recommended):
+
+```bash
+RFD3_TRACE_NVTX=1 RFD3_PROFILE_SYNC=1 \
+nsys profile -o ./logs/nsys/rfd3_common_sim_lowmem \
+--force-overwrite=true \
+--trace=cuda,nvtx,osrt,cublas,cudnn \
+--cuda-memory-usage=true \
+rfd3 design out_dir=logs/inference_outs/common_sim_lowmem/0 \
+inputs=models/rfd3/docs/examples/common_simulate.json \
+low_memory_mode=True diffusion_batch_size=1 n_batches=1 \
+skip_existing=False dump_trajectories=False prevalidate_inputs=False
+```
+
+Low-memory mode from CLI config override (recommended):
+
+```bash
+RFD3_TRACE_NVTX=1 RFD3_PROFILE_SYNC=1 \
+nsys profile -o ./logs/nsys/rfd3_common_sim_lowmem \
+--force-overwrite=true \
+--trace=cuda,nvtx,osrt,cublas,cudnn \
+--cuda-memory-usage=true \
+rfd3 design out_dir=logs/inference_outs/common_sim_lowmem/0 \
+inputs=models/rfd3/docs/examples/common_simulate.json \
+low_memory_mode=True diffusion_batch_size=1 n_batches=1 \
+skip_existing=False dump_trajectories=False prevalidate_inputs=False
+```
+
 ## Reading Results In Nsight Systems
 
 Look at NVTX lanes and group by range name prefix:
