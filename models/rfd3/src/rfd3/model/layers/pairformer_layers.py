@@ -5,6 +5,7 @@ from rfd3.model.layers.layer_utils import (
     Transition,
     linearNoBias,
 )
+from rfd3.utils.tracing import trace_range
 from torch import nn
 
 from foundry.training.checkpoint import activation_checkpointing
@@ -47,37 +48,42 @@ class AttentionPairBiasPairformerDeepspeed(nn.Module):
     ):
         # Input projections
         assert S_I is None
-        A_I = self.ln_1(A_I)
+        with trace_range("RFD3/Layers/Pairformer/AttentionPairBias/LayerNorm"):
+            A_I = self.ln_1(A_I)
 
         if self.use_deepspeed_evo or self.force_bfloat16:
-            A_I = A_I.to(torch.bfloat16)
+            with trace_range("RFD3/Layers/Pairformer/AttentionPairBias/CastBFloat16"):
+                A_I = A_I.to(torch.bfloat16)
 
-        Q_IH = self.to_q(A_I)  # / np.sqrt(self.c)
-        K_IH = self.to_k(A_I)
-        V_IH = self.to_v(A_I)
-        B_IIH = self.to_b(self.ln_0(Z_II)) + Beta_II[..., None]
-        G_IH = self.to_g(A_I)
+        with trace_range("RFD3/Layers/Pairformer/AttentionPairBias/QKV_Projection"):
+            Q_IH = self.to_q(A_I)  # / np.sqrt(self.c)
+            K_IH = self.to_k(A_I)
+            V_IH = self.to_v(A_I)
+            B_IIH = self.to_b(self.ln_0(Z_II)) + Beta_II[..., None]
+            G_IH = self.to_g(A_I)
 
         B, L = B_IIH.shape[:2]
 
         if not self.use_deepspeed_evo or L <= 24:
-            Q_IH = Q_IH / torch.sqrt(
-                torch.tensor(self.c).to(Q_IH.device, torch.bfloat16)
-            )
-            # Attention
-            A_IIH = torch.softmax(
-                torch.einsum("...ihd,...jhd->...ijh", Q_IH, K_IH) + B_IIH, dim=-2
-            )  # softmax over j
-            ## G_IH: [I, H, C]
-            ## A_IIH: [I, I, H]
-            ## V_IH: [I, H, C]
-            A_I = torch.einsum("...ijh,...jhc->...ihc", A_IIH, V_IH)
-            A_I = G_IH * A_I  # [B, I, H, C]
-            A_I = A_I.flatten(start_dim=-2)  # [B, I, Ca]
+            with trace_range("RFD3/Layers/Pairformer/AttentionPairBias/AttentionComputation"):
+                Q_IH = Q_IH / torch.sqrt(
+                    torch.tensor(self.c).to(Q_IH.device, torch.bfloat16)
+                )
+                # Attention
+                A_IIH = torch.softmax(
+                    torch.einsum("...ihd,...jhd->...ijh", Q_IH, K_IH) + B_IIH, dim=-2
+                )  # softmax over j
+                ## G_IH: [I, H, C]
+                ## A_IIH: [I, I, H]
+                ## V_IH: [I, H, C]
+                A_I = torch.einsum("...ijh,...jhc->...ihc", A_IIH, V_IH)
+                A_I = G_IH * A_I  # [B, I, H, C]
+                A_I = A_I.flatten(start_dim=-2)  # [B, I, Ca]
         else:
             raise NotImplementedError
 
-        A_I = self.to_a(A_I)
+        with trace_range("RFD3/Layers/Pairformer/AttentionPairBias/OutputProjection"):
+            A_I = self.to_a(A_I)
 
         return A_I
 
@@ -115,14 +121,21 @@ class PairformerBlock(nn.Module):
             )
 
     @activation_checkpointing
-    def forward(self, S_I, Z_II):
-        with torch.amp.autocast(
-            device_type=device_of(self).type, enabled=True, dtype=torch.bfloat16
-        ):
-            Z_II = Z_II + self.z_transition(Z_II)
-            if S_I is not None:
-                S_I = S_I + self.attention_pair_bias(
-                    S_I, None, Z_II, Beta_II=torch.tensor([0.0], device=Z_II.device)
-                )
-                S_I = S_I + self.s_transition(S_I)
+    def forward(self, S_I, Z_II, trace_prefix="RFD3/Layers/Pairformer/Block"):
+        with trace_range(trace_prefix):
+            with torch.amp.autocast(
+                device_type=device_of(self).type, enabled=True, dtype=torch.bfloat16
+            ):
+                with trace_range(f"{trace_prefix}/PairTransition"):
+                    Z_II = Z_II + self.z_transition(Z_II)
+                if S_I is not None:
+                    with trace_range(f"{trace_prefix}/AttentionPairBiasUpdate"):
+                        S_I = S_I + self.attention_pair_bias(
+                            S_I,
+                            None,
+                            Z_II,
+                            Beta_II=torch.tensor([0.0], device=Z_II.device),
+                        )
+                    with trace_range(f"{trace_prefix}/SingleTransition"):
+                        S_I = S_I + self.s_transition(S_I)
         return S_I, Z_II

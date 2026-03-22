@@ -152,25 +152,26 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         ref_initializer_outputs: dict[str, Any] | None,
         f_ref: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        # Motif setup to recenter the motif at every step
-        is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
+        with trace_range("RFD3/InferenceSampler/Default/Setup"):
+            # Motif setup to recenter the motif at every step
+            is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
 
-        # Book-keeping
-        noise_schedule = self._construct_inference_noise_schedule(
-            device=coord_atom_lvl_to_be_noised.device,
-            partial_t=f.get("partial_t", None),
-        )
+            # Book-keeping
+            noise_schedule = self._construct_inference_noise_schedule(
+                device=coord_atom_lvl_to_be_noised.device,
+                partial_t=f.get("partial_t", None),
+            )
 
-        L = f["ref_element"].shape[0]
-        D = diffusion_batch_size
+            L = f["ref_element"].shape[0]
+            D = diffusion_batch_size
 
-        X_L = self._get_initial_structure(
-            c0=noise_schedule[0],
-            D=D,
-            L=L,
-            coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
-            is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
-        )  # (D, L, 3)
+            X_L = self._get_initial_structure(
+                c0=noise_schedule[0],
+                D=D,
+                L=L,
+                coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
+                is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
+            )  # (D, L, 3)
 
         if self.s_jitter_origin > 0.0:
             X_L[:, is_motif_atom_with_fixed_coord, :] += torch.normal(
@@ -192,7 +193,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             zip(noise_schedule, noise_schedule[1:])
         ):
             with trace_range(
-                f"rfd3.model.inference_sampler.default.step_{step_num + 1:03d}_of_{total_steps:03d}"
+                f"RFD3/InferenceSampler/Default/Step_{step_num + 1:03d}_of_{total_steps:03d}"
             ):
                 # Assert no grads on X_L
                 assert (
@@ -202,18 +203,19 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
                 # Apply a random rotation and translation to the structure
                 if self.allow_realignment:
-                    X_L, _ = centre_random_augment_around_motif(
-                        X_L,
-                        coord_atom_lvl_to_be_noised,
-                        is_motif_atom_with_fixed_coord,
-                        center_option=self.center_option,
-                        # If centering_affects_motif is True, the model's predictions from (step_num-1) might affect the motif
-                        centering_affects_motif=(max(step_num - 1, 0))
-                        >= threshold_step,
-                        # If keeping the motif position wrt the origin fixed, we can't do translational augmentation
-                        # We want to keep this position fixed in the interval where the model is not allowed to change it
-                        s_trans=self.s_trans if step_num >= threshold_step else 0.0,
-                    )
+                    with trace_range("RFD3/InferenceSampler/Default/Realignment"):
+                        X_L, _ = centre_random_augment_around_motif(
+                            X_L,
+                            coord_atom_lvl_to_be_noised,
+                            is_motif_atom_with_fixed_coord,
+                            center_option=self.center_option,
+                            # If centering_affects_motif is True, the model's predictions from (step_num-1) might affect the motif
+                            centering_affects_motif=(max(step_num - 1, 0))
+                            >= threshold_step,
+                            # If keeping the motif position wrt the origin fixed, we can't do translational augmentation
+                            # We want to keep this position fixed in the interval where the model is not allowed to change it
+                            s_trans=self.s_trans if step_num >= threshold_step else 0.0,
+                        )
 
                 # Update gamma & step scale
                 gamma = self.gamma_0 if c_t > self.gamma_min else 0
@@ -223,52 +225,55 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 t_hat = c_t_minus_1 * (gamma + 1)
 
                 # Noise the coordinates with scaled Gaussian noise
-                epsilon_L = (
-                    self.noise_scale
-                    * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
-                    * torch.normal(
-                        mean=0.0, std=1.0, size=X_L.shape, device=X_L.device
+                with trace_range("RFD3/InferenceSampler/Default/NoiseInjection"):
+                    epsilon_L = (
+                        self.noise_scale
+                        * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
+                        * torch.normal(
+                            mean=0.0, std=1.0, size=X_L.shape, device=X_L.device
+                        )
                     )
-                )
-                epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
-                    0  # No noise injection for fixed atoms
-                )
-                X_noisy_L = X_L + epsilon_L
+                    epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
+                        0  # No noise injection for fixed atoms
+                    )
+                    X_noisy_L = X_L + epsilon_L
 
                 # Denoise the coordinates
                 # Handle chunked mode vs standard mode
                 if "chunked_pairwise_embedder" in initializer_outputs:
                     # Chunked mode: explicitly provide P_LL=None
-                    tic = time.time()
-                    chunked_embedder = initializer_outputs[
-                        "chunked_pairwise_embedder"
-                    ]  # Don't pop, just get
-                    other_outputs = {
-                        k: v
-                        for k, v in initializer_outputs.items()
-                        if k != "chunked_pairwise_embedder"
-                    }
-                    outs = diffusion_module(
-                        X_noisy_L=X_noisy_L,
-                        t=t_hat.tile(D),
-                        f=f,
-                        P_LL=None,  # Not used in chunked mode
-                        chunked_pairwise_embedder=chunked_embedder,
-                        initializer_outputs=other_outputs,
-                        **other_outputs,
-                    )
-                    toc = time.time()
-                    ranked_logger.info(
-                        f"[chunked] step {step_num}: {(toc - tic)*1000:.1f} ms"
-                    )
+                    with trace_range("RFD3/InferenceSampler/Default/ChunkedForward"):
+                        tic = time.time()
+                        chunked_embedder = initializer_outputs[
+                            "chunked_pairwise_embedder"
+                        ]  # Don't pop, just get
+                        other_outputs = {
+                            k: v
+                            for k, v in initializer_outputs.items()
+                            if k != "chunked_pairwise_embedder"
+                        }
+                        outs = diffusion_module(
+                            X_noisy_L=X_noisy_L,
+                            t=t_hat.tile(D),
+                            f=f,
+                            P_LL=None,  # Not used in chunked mode
+                            chunked_pairwise_embedder=chunked_embedder,
+                            initializer_outputs=other_outputs,
+                            **other_outputs,
+                        )
+                        toc = time.time()
+                        ranked_logger.info(
+                            f"[chunked] step {step_num}: {(toc - tic)*1000:.1f} ms"
+                        )
                 else:
                     # Standard mode: P_LL is included in initializer_outputs
-                    outs = diffusion_module(
-                        X_noisy_L=X_noisy_L,
-                        t=t_hat.tile(D),
-                        f=f,
-                        **initializer_outputs,
-                    )
+                    with trace_range("RFD3/InferenceSampler/Default/StandardForward"):
+                        outs = diffusion_module(
+                            X_noisy_L=X_noisy_L,
+                            t=t_hat.tile(D),
+                            f=f,
+                            **initializer_outputs,
+                        )
 
                 X_denoised_L = outs["X_L"] if "X_L" in outs else outs
 
@@ -281,38 +286,39 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 if self.use_classifier_free_guidance and (
                     self.cfg_t_max is None or c_t > self.cfg_t_max
                 ):
-                    X_noisy_L_stripped = strip_X(X_noisy_L, f_ref)
+                    with trace_range("RFD3/ClassifierFreeGuidance"):
+                        X_noisy_L_stripped = strip_X(X_noisy_L, f_ref)
 
-                    # unconditional forward pass
-                    outs_ref = diffusion_module(
-                        X_noisy_L=X_noisy_L_stripped,  # modify X
-                        t=t_hat.tile(D),
-                        f=f_ref,  # modified f
-                        **ref_initializer_outputs,
-                    )
-
-                    X_denoised_L_stripped = outs_ref["X_L"]
-
-                    delta_L_ref = (
-                        X_noisy_L_stripped - X_denoised_L_stripped
-                    ) / t_hat  # gradient of x wrt. t at x_t_hat
-
-                    # pad delta_L_ref with zeros to match delta_L (for the unindexed atoms)
-                    if delta_L_ref.shape[1] < delta_L.shape[1]:
-                        delta_L_ref = torch.cat(
-                            [
-                                delta_L_ref,
-                                torch.zeros_like(
-                                    delta_L[:, delta_L_ref.shape[1] :, :]
-                                ),
-                            ],
-                            dim=1,
+                        # unconditional forward pass
+                        outs_ref = diffusion_module(
+                            X_noisy_L=X_noisy_L_stripped,  # modify X
+                            t=t_hat.tile(D),
+                            f=f_ref,  # modified f
+                            **ref_initializer_outputs,
                         )
 
-                    # apply CFG
-                    delta_L = delta_L + (self.cfg_scale - 1) * (
-                        delta_L - delta_L_ref
-                    )
+                        X_denoised_L_stripped = outs_ref["X_L"]
+
+                        delta_L_ref = (
+                            X_noisy_L_stripped - X_denoised_L_stripped
+                        ) / t_hat  # gradient of x wrt. t at x_t_hat
+
+                        # pad delta_L_ref with zeros to match delta_L (for the unindexed atoms)
+                        if delta_L_ref.shape[1] < delta_L.shape[1]:
+                            delta_L_ref = torch.cat(
+                                [
+                                    delta_L_ref,
+                                    torch.zeros_like(
+                                        delta_L[:, delta_L_ref.shape[1] :, :]
+                                    ),
+                                ],
+                                dim=1,
+                            )
+
+                        # apply CFG
+                        delta_L = delta_L + (self.cfg_scale - 1) * (
+                            delta_L - delta_L_ref
+                        )
 
                 if exists(outs.get("sequence_logits_I")):
                     # Compute confidence
@@ -325,7 +331,8 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                     sequence_entropy_traj.append(seq_entropy)
 
                 # Update the coordinates, scaled by the step size
-                X_L = X_noisy_L + step_scale * d_t * delta_L
+                with trace_range("RFD3/InferenceSampler/Default/CoordinateUpdate"):
+                    X_L = X_noisy_L + step_scale * d_t * delta_L
 
                 # Append the results to the trajectory (for visualization of the diffusion process)
                 X_noisy_L_scaled = (
@@ -440,7 +447,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             zip(noise_schedule, noise_schedule[1:])
         ):
             with trace_range(
-                f"rfd3.model.inference_sampler.symmetry.step_{step_num + 1:03d}_of_{total_steps:03d}"
+                f"RFD3/InferenceSampler/Symmetry/Step_{step_num + 1:03d}_of_{total_steps:03d}"
             ):
                 # Assert no grads on X_L
                 assert (

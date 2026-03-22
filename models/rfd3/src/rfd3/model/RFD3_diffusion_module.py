@@ -160,13 +160,15 @@ class RFD3DiffusionModule(nn.Module):
         return X_out_L
 
     def process_time_(self, t_L, i):
-        C_L = self.process_n[i](
-            self.fourier_embedding[i](
-                1 / 4 * torch.log(torch.clamp(t_L, min=1e-20) / self.sigma_data)
+        with trace_range(f"RFD3/DiffusionModule/TimeEmbedding/Fourier_{i}"):
+            C_L = self.process_n[i](
+                self.fourier_embedding[i](
+                    1 / 4 * torch.log(torch.clamp(t_L, min=1e-20) / self.sigma_data)
+                )
             )
-        )
-        # Mask out zero-time features;
-        C_L = C_L * (t_L > 0).float()[..., None]  # [B, L, C_atom]
+        with trace_range(f"RFD3/DiffusionModule/TimeEmbedding/Mask_{i}"):
+            # Mask out zero-time features;
+            C_L = C_L * (t_L > 0).float()[..., None]  # [B, L, C_atom]
         return C_L
 
     def forward(
@@ -191,7 +193,7 @@ class RFD3DiffusionModule(nn.Module):
         Computes denoised positions given encoded features and noisy coordinates.
         """
         # ... Collect inputs
-        with trace_range("rfd3.model.diffusion.forward.collect_inputs"):
+        with trace_range("RFD3/DiffusionModule/Forward/CollectInputs"):
             tok_idx = f["atom_to_token_map"]
             L = len(tok_idx)
             I = tok_idx.max() + 1  # Number of tokens
@@ -203,7 +205,7 @@ class RFD3DiffusionModule(nn.Module):
             )
 
         # ... Expand t tensors
-        with trace_range("rfd3.model.diffusion.forward.expand_time"):
+        with trace_range("RFD3/DiffusionModule/Forward/ExpandTime"):
             t_L = t.unsqueeze(-1).expand(-1, L) * (
                 ~f["is_motif_atom_with_fixed_coord"]
             ).float().unsqueeze(0)
@@ -212,24 +214,24 @@ class RFD3DiffusionModule(nn.Module):
             ).float().unsqueeze(0)
 
         # ... Create scaled positions
-        with trace_range("rfd3.model.diffusion.forward.scale_positions"):
+        with trace_range("RFD3/DiffusionModule/Forward/PositionScaling"):
             R_L_uniform = self.scale_positions_in(X_noisy_L, t)
             R_noisy_L = self.scale_positions_in(X_noisy_L, t_L)
 
         # ... Pool initial representation to sequence level
-        with trace_range("rfd3.model.diffusion.forward.pool_to_tokens"):
+        with trace_range("RFD3/DiffusionModule/Forward/PoolToTokens"):
             A_I = self.process_a(R_noisy_L, tok_idx=tok_idx)
             S_I = self.downcast_c(C_L, S_I, tok_idx=tok_idx)
 
         # ... Add batch-wise features to inputs
-        with trace_range("rfd3.model.diffusion.forward.add_time_features"):
+        with trace_range("RFD3/DiffusionModule/Forward/AddTimeFeatures"):
             Q_L = Q_L_init.unsqueeze(0) + self.process_r(R_noisy_L)
             C_L = C_L.unsqueeze(0) + self.process_time_(t_L, i=0)
             S_I = S_I.unsqueeze(0) + self.process_time_(t_I, i=1)
             C_L = C_L + self.process_c(C_L)
 
         # ... Run Local-Atom Self Attention and Pool
-        with trace_range("rfd3.model.diffusion.forward.atom_encoder"):
+        with trace_range("RFD3/DiffusionModule/AtomEncoder"):
             if chunked_pairwise_embedder is not None:
                 # Chunked mode: pass chunked embedder and feature dict
                 Q_L = self.encoder(
@@ -247,7 +249,7 @@ class RFD3DiffusionModule(nn.Module):
             A_I = self.downcast_q(Q_L, A_I=A_I, S_I=S_I, tok_idx=tok_idx)
 
         # ... Run forward with recycling
-        with trace_range("rfd3.model.diffusion.forward.recycle"):
+        with trace_range("RFD3/DiffusionModule/Recycling"):
             recycled_features = self.forward_with_recycle(
                 n_recycle,
                 X_noisy_L=X_noisy_L,
@@ -265,7 +267,7 @@ class RFD3DiffusionModule(nn.Module):
             )
 
         # ... Collect outputs
-        with trace_range("rfd3.model.diffusion.forward.outputs"):
+        with trace_range("RFD3/DiffusionModule/OutputHeads"):
             outputs = {
                 "X_L": recycled_features["X_L"],  # [B, L, 3] denoised positions
                 "sequence_indices_I": recycled_features["sequence_indices_I"],
@@ -296,7 +298,7 @@ class RFD3DiffusionModule(nn.Module):
                     torch.clear_autocast_cache()
 
                 # Run forward
-                with trace_range(f"rfd3.model.diffusion.recycle.iter_{i}"):
+                with trace_range(f"RFD3/DiffusionModule/Recycling/Recycle_{i}"):
                     recycled_features = self.process_(
                         D_II_self=recycled_features.get("D_II_self"),
                         X_L_self=recycled_features.get("X_L"),
@@ -324,9 +326,9 @@ class RFD3DiffusionModule(nn.Module):
         initializer_outputs=None,
         **_,
     ):
-        with trace_range("rfd3.model.diffusion.process"):
+        with trace_range("RFD3/DiffusionModule/Process"):
             # ... Embed token level features with atom level encodings
-            with trace_range("rfd3.model.diffusion.process.token_encoder"):
+            with trace_range("RFD3/DiffusionModule/TokenEncoder"):
                 S_I, Z_II = self.diffusion_token_encoder(
                     f=f,
                     R_L=R_L_uniform,
@@ -338,7 +340,7 @@ class RFD3DiffusionModule(nn.Module):
                 )
 
             # ... Diffusion transformer
-            with trace_range("rfd3.model.diffusion.process.token_transformer"):
+            with trace_range("RFD3/DiffusionModule/DiffusionTransformer"):
                 A_I = self.diffusion_transformer(
                     A_I,
                     S_I,
@@ -353,7 +355,7 @@ class RFD3DiffusionModule(nn.Module):
                 )
 
             # ... Decoder readout
-            with trace_range("rfd3.model.diffusion.process.decoder"):
+            with trace_range("RFD3/DiffusionModule/Decoder"):
                 if chunked_pairwise_embedder is not None:
                     # Chunked mode: pass embedder and no P_LL
                     A_I, Q_L, o = self.decoder(
@@ -383,7 +385,7 @@ class RFD3DiffusionModule(nn.Module):
                     )
 
             # ... Process outputs to positions update
-            with trace_range("rfd3.model.diffusion.process.outputs"):
+            with trace_range("RFD3/DiffusionModule/OutputHeads/PositionAndSequence"):
                 R_update_L = self.to_r_update(Q_L)
                 X_out_L = self.scale_positions_out(R_update_L, X_noisy_L, t_L)
 

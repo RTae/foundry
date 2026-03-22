@@ -26,6 +26,7 @@ from rfd3.model.layers.layer_utils import (
     linearNoBias,
 )
 from rfd3.model.layers.pairformer_layers import PairformerBlock
+from rfd3.utils.tracing import trace_range
 from torch.nn.functional import one_hot
 
 from foundry import DISABLE_CHECKPOINTING
@@ -52,14 +53,17 @@ class ConditionedTransitionBlock(nn.Module):
         Ai,  # [B, I, C_token]
         Si,  # [B, I, C_token]
     ):
-        Ai = self.ada_ln(Ai, Si)
-        # BUG: This is not the correct implementation of SwiGLU
-        # Bi = torch.sigmoid(self.linear_1(Ai)) * self.linear_2(Ai)
-        # FIX: This is the correct implementation of SwiGLU
-        Bi = torch.nn.functional.silu(self.linear_1(Ai)) * self.linear_2(Ai)
+        with trace_range("RFD3/Layers/ConditionedTransitionBlock/AdaLN"):
+            Ai = self.ada_ln(Ai, Si)
+        with trace_range("RFD3/Layers/ConditionedTransitionBlock/SwiGLU"):
+            # BUG: This is not the correct implementation of SwiGLU
+            # Bi = torch.sigmoid(self.linear_1(Ai)) * self.linear_2(Ai)
+            # FIX: This is the correct implementation of SwiGLU
+            Bi = torch.nn.functional.silu(self.linear_1(Ai)) * self.linear_2(Ai)
 
-        # Output projection (from adaLN-Zero)
-        return self.linear_output_project(Si) * self.linear_3(Bi)
+        with trace_range("RFD3/Layers/ConditionedTransitionBlock/OutputProjection"):
+            # Output projection (from adaLN-Zero)
+            return self.linear_output_project(Si) * self.linear_3(Bi)
 
 
 class PositionPairDistEmbedder(nn.Module):
@@ -98,17 +102,20 @@ class PositionPairDistEmbedder(nn.Module):
         return P_LL
 
     def forward(self, ref_pos, valid_mask):
-        D_LL = ref_pos.unsqueeze(-2) - ref_pos.unsqueeze(-3)
-        V_LL = valid_mask
+        with trace_range("RFD3/Layers/PositionPairDistEmbedder/ComputePairwise"):
+            D_LL = ref_pos.unsqueeze(-2) - ref_pos.unsqueeze(-3)
+            V_LL = valid_mask
 
         if self.embed_frame:
-            # Embed pairwise distances
-            return self.forward_af3(D_LL, V_LL)
-        norm = torch.linalg.norm(D_LL, dim=-1, keepdim=True) ** 2
-        norm = torch.clamp(norm, min=1e-6)
-        inv_dist = 1 / (1 + norm)
-        P_LL = self.process_inverse_dist(inv_dist) * V_LL
-        P_LL = P_LL + self.process_valid_mask(V_LL.to(P_LL.dtype)) * V_LL
+            with trace_range("RFD3/Layers/PositionPairDistEmbedder/FrameEmbedding"):
+                # Embed pairwise distances
+                return self.forward_af3(D_LL, V_LL)
+        with trace_range("RFD3/Layers/PositionPairDistEmbedder/InverseDistance"):
+            norm = torch.linalg.norm(D_LL, dim=-1, keepdim=True) ** 2
+            norm = torch.clamp(norm, min=1e-6)
+            inv_dist = 1 / (1 + norm)
+            P_LL = self.process_inverse_dist(inv_dist) * V_LL
+            P_LL = P_LL + self.process_valid_mask(V_LL.to(P_LL.dtype)) * V_LL
         return P_LL
 
 
@@ -486,33 +493,36 @@ class Upcast(nn.Module):
 
     def forward_(self, Q_IA, A_I, valid_mask=None):
         if self.method == "broadcast":
-            Q_IA = Q_IA + self.project(A_I)[..., None, :]
+            with trace_range("RFD3/Layers/Upcast/Broadcast"):
+                Q_IA = Q_IA + self.project(A_I)[..., None, :]
         elif self.method == "cross_attention":
             assert exists(A_I) and exists(valid_mask)
-            # Split Tokens
-            A_I = rearrange(A_I, "b n (s c) -> b n s c", s=self.n_split)
-            n_tokens, n_atom_per_tok = Q_IA.shape[1], Q_IA.shape[2]
+            with trace_range("RFD3/Layers/Upcast/CrossAttention"):
+                # Split Tokens
+                A_I = rearrange(A_I, "b n (s c) -> b n s c", s=self.n_split)
+                n_tokens, n_atom_per_tok = Q_IA.shape[1], Q_IA.shape[2]
 
-            # Attention mask: ..., n_atom_per_tok, n_split
-            attn_mask = torch.full(
-                (n_tokens, 1, n_atom_per_tok), True, device=Q_IA.device
-            )
-            attn_mask[~valid_mask.view_as(attn_mask)] = False
+                # Attention mask: ..., n_atom_per_tok, n_split
+                attn_mask = torch.full(
+                    (n_tokens, 1, n_atom_per_tok), True, device=Q_IA.device
+                )
+                attn_mask[~valid_mask.view_as(attn_mask)] = False
 
-            attn_mask = torch.ones(
-                (n_tokens, n_atom_per_tok, self.n_split), device=A_I.device, dtype=bool
-            )
-            attn_mask[~valid_mask, :] = False
+                attn_mask = torch.ones(
+                    (n_tokens, n_atom_per_tok, self.n_split), device=A_I.device, dtype=bool
+                )
+                attn_mask[~valid_mask, :] = False
 
-            Q_IA = Q_IA + self.gca(q=Q_IA, kv=A_I, attn_mask=attn_mask)
+                Q_IA = Q_IA + self.gca(q=Q_IA, kv=A_I, attn_mask=attn_mask)
         return Q_IA
 
     def forward(self, Q_L, A_I, tok_idx):
-        valid_mask = build_valid_mask(tok_idx)
-        Q_IA = ungroup_atoms(Q_L, valid_mask)
-        Q_IA = self.forward_(Q_IA, A_I, valid_mask)
-        Q_L = group_atoms(Q_IA, valid_mask)
-        return Q_L
+        with trace_range("RFD3/Layers/Upcast"):
+            valid_mask = build_valid_mask(tok_idx)
+            Q_IA = ungroup_atoms(Q_L, valid_mask)
+            Q_IA = self.forward_(Q_IA, A_I, valid_mask)
+            Q_L = group_atoms(Q_IA, valid_mask)
+            return Q_L
 
 
 class Downcast(nn.Module):
@@ -546,14 +556,16 @@ class Downcast(nn.Module):
 
     def forward_(self, Q_IA, A_I, S_I=None, valid_mask=None):
         if self.method == "mean":
-            A_I_update = self.project(Q_IA).sum(-2) / valid_mask.sum(-1, keepdim=True)
+            with trace_range("RFD3/Layers/Downcast/MeanPooling"):
+                A_I_update = self.project(Q_IA).sum(-2) / valid_mask.sum(-1, keepdim=True)
         elif self.method == "cross_attention":
             assert exists(A_I) and exists(valid_mask)
-            # Attention mask: ..., 1, n_atom_per_tok (1 querying token to atoms in token)
-            attn_mask = valid_mask[..., None, :]
-            A_I_update = self.gca(
-                q=A_I[..., None, :], kv=Q_IA, attn_mask=attn_mask
-            ).squeeze(-2)
+            with trace_range("RFD3/Layers/Downcast/CrossAttention"):
+                # Attention mask: ..., 1, n_atom_per_tok (1 querying token to atoms in token)
+                attn_mask = valid_mask[..., None, :]
+                A_I_update = self.gca(
+                    q=A_I[..., None, :], kv=Q_IA, attn_mask=attn_mask
+                ).squeeze(-2)
 
         A_I = A_I + A_I_update if exists(A_I) else A_I_update
 
@@ -562,23 +574,24 @@ class Downcast(nn.Module):
         return A_I
 
     def forward(self, Q_L, A_I, S_I=None, tok_idx=None):
-        valid_mask = build_valid_mask(tok_idx)
-        if Q_L.ndim == 2:
-            squeeze = True
-            Q_L = Q_L.unsqueeze(0)
-        else:
-            squeeze = False
+        with trace_range("RFD3/Layers/Downcast"):
+            valid_mask = build_valid_mask(tok_idx)
+            if Q_L.ndim == 2:
+                squeeze = True
+                Q_L = Q_L.unsqueeze(0)
+            else:
+                squeeze = False
 
-        A_I = A_I.unsqueeze(0) if exists(A_I) and A_I.ndim == 2 else A_I
-        S_I = S_I.unsqueeze(0) if exists(S_I) and S_I.ndim == 2 else S_I
+            A_I = A_I.unsqueeze(0) if exists(A_I) and A_I.ndim == 2 else A_I
+            S_I = S_I.unsqueeze(0) if exists(S_I) and S_I.ndim == 2 else S_I
 
-        Q_IA = ungroup_atoms(Q_L, valid_mask)
+            Q_IA = ungroup_atoms(Q_L, valid_mask)
 
-        A_I = self.forward_(Q_IA, A_I, S_I, valid_mask=valid_mask)
+            A_I = self.forward_(Q_IA, A_I, S_I, valid_mask=valid_mask)
 
-        if squeeze:
-            A_I = A_I.squeeze(0)
-        return A_I
+            if squeeze:
+                A_I = A_I.squeeze(0)
+            return A_I
 
 
 ######################################################################################
@@ -614,27 +627,30 @@ class LocalTokenTransformer(nn.Module):
         )
 
     def forward(self, A_I, S_I, Z_II, f, X_L, full=False):
-        indices = create_attention_indices(
-            X_L=X_L,
-            f=f,
-            tok_idx=torch.arange(A_I.shape[1], device=A_I.device),
-            n_attn_keys=self.n_keys,
-            n_attn_seq_neighbours=self.n_local_tokens,
-        )
+        with trace_range("RFD3/DiffusionModule/DiffusionTransformer/BuildAttentionIndices"):
+            indices = create_attention_indices(
+                X_L=X_L,
+                f=f,
+                tok_idx=torch.arange(A_I.shape[1], device=A_I.device),
+                n_attn_keys=self.n_keys,
+                n_attn_seq_neighbours=self.n_local_tokens,
+            )
 
         for i, block in enumerate(self.blocks):
-            # Set checkpointing
-            block.attention_pair_bias.use_checkpointing = not DISABLE_CHECKPOINTING
-            # A_I: [B, L, C_token]
-            # S_I: [B, L, C_s]
-            # Z_II: [B, L, L, C_tokenpair]
-            A_I = block(
-                A_I,
-                S_I,
-                Z_II,
-                indices=indices,
-                full=full,  # (self.training and torch.is_grad_enabled()),  # Does not accelerate inference, but memory *does* scale better
-            )
+            with trace_range(f"RFD3/DiffusionModule/DiffusionTransformer/Block_{i}"):
+                # Set checkpointing
+                block.attention_pair_bias.use_checkpointing = not DISABLE_CHECKPOINTING
+                # A_I: [B, L, C_token]
+                # S_I: [B, L, C_s]
+                # Z_II: [B, L, L, C_tokenpair]
+                A_I = block(
+                    A_I,
+                    S_I,
+                    Z_II,
+                    indices=indices,
+                    full=full,  # (self.training and torch.is_grad_enabled()),  # Does not accelerate inference, but memory *does* scale better
+                    trace_prefix=f"RFD3/DiffusionModule/DiffusionTransformer/Block_{i}",
+                )
 
         return A_I
 
@@ -655,8 +671,14 @@ class LocalAtomTransformer(nn.Module):
         )
 
     def forward(self, Q_L, C_L, P_LL, **kwargs):
-        for block in self.blocks:
-            Q_L = block(Q_L, C_L, P_LL, **kwargs)
+        for i, block in enumerate(self.blocks):
+            Q_L = block(
+                Q_L,
+                C_L,
+                P_LL,
+                trace_prefix=f"RFD3/DiffusionModule/AtomEncoder/Block_{i}",
+                **kwargs,
+            )
         return Q_L
 
 
@@ -691,23 +713,30 @@ class StructureLocalAtomTransformerBlock(nn.Module):
         f=None,
         chunked_pairwise_embedder=None,
         initializer_outputs=None,
+        trace_prefix="RFD3/Layers/StructureLocalAtomTransformerBlock",
         **kwargs,
     ):
-        Q_L = Q_L + self.dropout(
-            self.attention_pair_bias(
-                Q_L,
-                C_L,
-                P_LL,
-                f=f,
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-                **kwargs,
+        with trace_range(f"{trace_prefix}/Attention"):
+            attn_out = self.dropout(
+                self.attention_pair_bias(
+                    Q_L,
+                    C_L,
+                    P_LL,
+                    f=f,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                    **kwargs,
+                )
             )
-        )
-        if exists(C_L):
-            Q_L = Q_L + self.transition_block(Q_L, C_L)
-        else:
-            Q_L = Q_L + self.transition_block(Q_L)
+        with trace_range(f"{trace_prefix}/ResidualAttention"):
+            Q_L = Q_L + attn_out
+        with trace_range(f"{trace_prefix}/Transition"):
+            if exists(C_L):
+                trans_out = self.transition_block(Q_L, C_L)
+            else:
+                trans_out = self.transition_block(Q_L)
+        with trace_range(f"{trace_prefix}/ResidualTransition"):
+            Q_L = Q_L + trans_out
         return Q_L
 
 
@@ -759,19 +788,23 @@ class CompactStreamingDecoder(nn.Module):
         initializer_outputs=None,
     ):
         for i in range(self.n_blocks):
-            Q_L = self.upcast[i](Q_L, A_I, tok_idx=tok_idx)
-            Q_L = self.atom_transformer[i](
-                Q_L,
-                C_L,
-                P_LL,
-                indices=indices,
-                f=f,
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-            )
+            with trace_range(f"RFD3/DiffusionModule/Decoder/Block_{i}/Upcast"):
+                Q_L = self.upcast[i](Q_L, A_I, tok_idx=tok_idx)
+            with trace_range(f"RFD3/DiffusionModule/Decoder/Block_{i}/AtomTransformer"):
+                Q_L = self.atom_transformer[i](
+                    Q_L,
+                    C_L,
+                    P_LL,
+                    indices=indices,
+                    f=f,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                    trace_prefix=f"RFD3/DiffusionModule/Decoder/Block_{i}",
+                )
 
         # Downcast to sequence
-        A_I = self.downcast(Q_L.detach(), A_I.detach(), S_I.detach(), tok_idx=tok_idx)
+        with trace_range("RFD3/DiffusionModule/Decoder/Downcast"):
+            A_I = self.downcast(Q_L.detach(), A_I.detach(), S_I.detach(), tok_idx=tok_idx)
 
         o = {}
         return A_I, Q_L, o

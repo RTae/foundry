@@ -31,7 +31,10 @@ def maybe_sync_cuda() -> None:
 @contextmanager
 def trace_range(name: str):
     if tracing_enabled() and cuda_ready():
-        with torch.cuda.nvtx.range(name):
+        torch.cuda.nvtx.range_push(name)
+        try:
             yield
+        finally:
+            torch.cuda.nvtx.range_pop()
         return
     yield
