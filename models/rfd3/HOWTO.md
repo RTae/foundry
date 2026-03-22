@@ -26,3 +26,28 @@ Notes:
 
 - Keep these commands as the source of truth for Nsight profiling in this repo.
 - Equivalent guidance is documented in models/rfd3/docs/nsight_tracing.md.
+
+Helper script integration (equivalent to canonical command):
+
+```bash
+bash models/rfd3/scripts/run_nsys_profile.sh \
+	--output ./logs/nsys/rfd3_common_sim \
+	--sync true \
+	-- \
+	rfd3 design out_dir=logs/inference_outs/common_sim/0 \
+	inputs=models/rfd3/docs/examples/common_simulate.json \
+	skip_existing=False dump_trajectories=False prevalidate_inputs=False
+```
+
+Single-model via helper script:
+
+```bash
+bash models/rfd3/scripts/run_nsys_profile.sh \
+	--output ./logs/nsys/rfd3_common_sim_single_model \
+	--sync true \
+	-- \
+	rfd3 design out_dir=logs/inference_outs/common_sim_single_model/0 \
+	inputs=models/rfd3/docs/examples/common_simulate.json \
+	diffusion_batch_size=1 n_batches=1 \
+	skip_existing=False dump_trajectories=False prevalidate_inputs=False
+```

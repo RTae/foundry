@@ -68,6 +68,24 @@ Optional helper script (for quick ad hoc profiling):
 bash models/rfd3/scripts/run_nsys_profile.sh --output rfd3_profile -- python inference_script.py
 ```
 
+Helper script integrated with canonical workflow:
+
+```bash
+bash models/rfd3/scripts/run_nsys_profile.sh \
+	--output ./logs/nsys/rfd3_common_sim \
+	--sync true \
+	-- \
+	rfd3 design out_dir=logs/inference_outs/common_sim/0 \
+	inputs=models/rfd3/docs/examples/common_simulate.json \
+	skip_existing=False dump_trajectories=False prevalidate_inputs=False
+```
+
+The script uses the same Nsight flags as canonical docs by default:
+
+- --force-overwrite=true
+- --trace=cuda,nvtx,osrt,cublas,cudnn
+- --cuda-memory-usage=true
+
 ## Reading Results In Nsight Systems
 
 Look at NVTX lanes and group by range name prefix:
