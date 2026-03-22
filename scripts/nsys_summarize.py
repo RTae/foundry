@@ -172,11 +172,88 @@ def build_block_events_table(conn: sqlite3.Connection) -> list[tuple[int, int, i
         block_events.append((block_id, start, end))
 
     cur.executemany("INSERT INTO _block_events(block_id, start, end) VALUES (?, ?, ?)", block_events)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_block_events_time ON _block_events(start, end)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_block_events_id ON _block_events(block_id)")
     conn.commit()
     return block_events
 
 
-def summarize_blocks(conn: sqlite3.Connection) -> list[BlockStat]:
+def block_time_window_ns(block_events: list[tuple[int, int, int]]) -> tuple[int, int] | None:
+    if not block_events:
+        return None
+    starts = [s for _, s, _ in block_events]
+    ends = [e for _, _, e in block_events]
+    return (min(starts), max(ends))
+
+
+def materialize_kernel_window(
+    conn: sqlite3.Connection,
+    window_ns: tuple[int, int] | None,
+) -> str:
+    """Create an indexed temp table of kernels in the relevant time window."""
+    cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS _kernels_window")
+    if window_ns is None:
+        cur.execute(
+            """
+            CREATE TEMP TABLE _kernels_window AS
+            SELECT start, end, shortName, registersPerThread, gridX, gridY, gridZ, blockX, blockY, blockZ
+            FROM CUPTI_ACTIVITY_KIND_KERNEL
+            """
+        )
+    else:
+        start_ns, end_ns = window_ns
+        cur.execute(
+            """
+            CREATE TEMP TABLE _kernels_window AS
+            SELECT start, end, shortName, registersPerThread, gridX, gridY, gridZ, blockX, blockY, blockZ
+            FROM CUPTI_ACTIVITY_KIND_KERNEL
+            WHERE end > ? AND start < ?
+            """,
+            (start_ns, end_ns),
+        )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_kernels_window_time ON _kernels_window(start, end)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_kernels_window_name ON _kernels_window(shortName)")
+    conn.commit()
+    return "_kernels_window"
+
+
+def materialize_memory_window(
+    conn: sqlite3.Connection,
+    window_ns: tuple[int, int] | None,
+) -> str:
+    """Create an indexed temp table of device memory events in the relevant time window."""
+    cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS _mem_window")
+    if window_ns is None:
+        cur.execute(
+            """
+            CREATE TEMP TABLE _mem_window AS
+            SELECT start, address, bytes, memKind, memoryOperationType
+            FROM CUDA_GPU_MEMORY_USAGE_EVENTS
+            WHERE memKind = 2
+            """
+        )
+    else:
+        start_ns, end_ns = window_ns
+        cur.execute(
+            """
+            CREATE TEMP TABLE _mem_window AS
+            SELECT start, address, bytes, memKind, memoryOperationType
+            FROM CUDA_GPU_MEMORY_USAGE_EVENTS
+            WHERE memKind = 2
+              AND start >= ?
+              AND start <= ?
+            """,
+            (start_ns, end_ns),
+        )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_window_time ON _mem_window(start)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_window_addr ON _mem_window(address)")
+    conn.commit()
+    return "_mem_window"
+
+
+def summarize_blocks(conn: sqlite3.Connection, kernel_table: str = "CUPTI_ACTIVITY_KIND_KERNEL") -> list[BlockStat]:
     block_events = build_block_events_table(conn)
     if not block_events:
         return []
@@ -189,7 +266,7 @@ def summarize_blocks(conn: sqlite3.Connection) -> list[BlockStat]:
 
     # Aggregate overlapping kernel durations for each block and kernel name.
     overlap_rows = cur.execute(
-        """
+        f"""
         SELECT
           b.block_id AS block_id,
           COALESCE(s.value, '<unknown>') AS kernel_name,
@@ -200,14 +277,14 @@ def summarize_blocks(conn: sqlite3.Connection) -> list[BlockStat]:
               ELSE 0
             END
           ) AS overlap_ns
-        FROM _block_events b
-        JOIN CUPTI_ACTIVITY_KIND_KERNEL k
+                FROM _block_events b
+                JOIN {kernel_table} k
           ON k.end > b.start
          AND k.start < b.end
         LEFT JOIN StringIds s
           ON s.id = k.shortName
         GROUP BY b.block_id, kernel_name
-        """
+                """
     ).fetchall()
 
     by_block_kernel: dict[int, list[tuple[str, int]]] = defaultdict(list)
@@ -264,13 +341,12 @@ def summarize_blocks(conn: sqlite3.Connection) -> list[BlockStat]:
     return result
 
 
-def summarize_memory(conn: sqlite3.Connection) -> MemorySummary:
+def summarize_memory(conn: sqlite3.Connection, memory_table: str = "CUDA_GPU_MEMORY_USAGE_EVENTS") -> MemorySummary:
     cur = conn.cursor()
     rows = cur.execute(
-        """
+        f"""
         SELECT start, address, bytes, memKind, memoryOperationType
-        FROM CUDA_GPU_MEMORY_USAGE_EVENTS
-        WHERE memKind = 2
+        FROM {memory_table}
         ORDER BY start
         """
     ).fetchall()
@@ -315,13 +391,12 @@ def summarize_memory(conn: sqlite3.Connection) -> MemorySummary:
         peak_active_bytes = 0
 
     per_block = cur.execute(
-        """
+        f"""
         SELECT b.block_id, COUNT(*) AS allocs, SUM(m.bytes) AS alloc_bytes
-        FROM _block_events b
-        LEFT JOIN CUDA_GPU_MEMORY_USAGE_EVENTS m
+                FROM _block_events b
+                LEFT JOIN {memory_table} m
           ON m.start >= b.start
          AND m.start <= b.end
-         AND m.memKind = 2
          AND m.memoryOperationType = 0
         GROUP BY b.block_id
         ORDER BY b.block_id
@@ -347,10 +422,14 @@ def summarize_memory(conn: sqlite3.Connection) -> MemorySummary:
     )
 
 
-def summarize_kernels(conn: sqlite3.Connection, top_n: int = 15) -> tuple[list[KernelSummaryRow], dict[str, float]]:
+def summarize_kernels(
+    conn: sqlite3.Connection,
+    top_n: int = 15,
+    kernel_table: str = "CUPTI_ACTIVITY_KIND_KERNEL",
+) -> tuple[list[KernelSummaryRow], dict[str, float]]:
     cur = conn.cursor()
     rows = cur.execute(
-        """
+        f"""
         SELECT
           COALESCE(s.value, '<unknown>') AS kernel_name,
           COUNT(*) AS calls,
@@ -361,12 +440,12 @@ def summarize_kernels(conn: sqlite3.Connection, top_n: int = 15) -> tuple[list[K
           AVG(
             CAST(k.gridX AS REAL) * k.gridY * k.gridZ * k.blockX * k.blockY * k.blockZ
           ) AS avg_threads
-        FROM CUPTI_ACTIVITY_KIND_KERNEL k
+                FROM {kernel_table} k
         LEFT JOIN StringIds s
           ON s.id = k.shortName
         GROUP BY kernel_name
         ORDER BY total_ns DESC
-        """
+                """
     ).fetchall()
 
     parsed: list[KernelSummaryRow] = []
@@ -396,9 +475,15 @@ def analyze_profile(label: str, input_path: Path, force_regen: bool = False, top
     sqlite_path = ensure_sqlite(input_path, force_regen=force_regen)
     conn = connect_db(sqlite_path)
     try:
-        block_stats = summarize_blocks(conn)
-        memory = summarize_memory(conn)
-        top_rows, category_totals = summarize_kernels(conn, top_n=top_kernels)
+        block_events = build_block_events_table(conn)
+        window_ns = block_time_window_ns(block_events)
+        kernel_table = materialize_kernel_window(conn, window_ns)
+        memory_table = materialize_memory_window(conn, window_ns)
+
+        # Reuse the temp block table and scoped temp event tables for faster joins.
+        block_stats = summarize_blocks(conn, kernel_table=kernel_table)
+        memory = summarize_memory(conn, memory_table=memory_table)
+        top_rows, category_totals = summarize_kernels(conn, top_n=top_kernels, kernel_table=kernel_table)
     finally:
         conn.close()
 
