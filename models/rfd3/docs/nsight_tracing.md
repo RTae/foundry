@@ -28,37 +28,44 @@ Ranges follow a hierarchical pattern such as:
 
 NVTX annotation overhead is minimized through environment gating in tracing helper:
 
-- `RFD3_TRACE_NVTX=true|false` controls NVTX ranges.
-- `RFD3_PROFILE_SYNC=true|false` enables optional CUDA synchronization where used.
+- `RFD3_TRACE_NVTX=1|0` (or true/false) controls NVTX ranges.
+- `RFD3_PROFILE_SYNC=1|0` (or true/false) enables optional CUDA synchronization where used.
 
-When `RFD3_TRACE_NVTX=false`, trace contexts become no-ops.
+When `RFD3_TRACE_NVTX=0`, trace contexts become no-ops.
 
 ## Quick Start
 
-Use helper script:
+Canonical command (default config):
+
+```bash
+RFD3_TRACE_NVTX=1 RFD3_PROFILE_SYNC=1 \
+nsys profile -o ./logs/nsys/rfd3_common_sim \
+--force-overwrite=true \
+--trace=cuda,nvtx,osrt,cublas,cudnn \
+--cuda-memory-usage=true \
+rfd3 design out_dir=logs/inference_outs/common_sim/0 \
+inputs=models/rfd3/docs/examples/common_simulate.json \
+skip_existing=False dump_trajectories=False prevalidate_inputs=False
+```
+
+Single-model command (runtime batch overrides):
+
+```bash
+RFD3_TRACE_NVTX=1 RFD3_PROFILE_SYNC=1 \
+nsys profile -o ./logs/nsys/rfd3_common_sim_single_model \
+--force-overwrite=true \
+--trace=cuda,nvtx,osrt,cublas,cudnn \
+--cuda-memory-usage=true \
+rfd3 design out_dir=logs/inference_outs/common_sim_single_model/0 \
+inputs=models/rfd3/docs/examples/common_simulate.json \
+diffusion_batch_size=1 n_batches=1 \
+skip_existing=False dump_trajectories=False prevalidate_inputs=False
+```
+
+Optional helper script (for quick ad hoc profiling):
 
 ```bash
 bash models/rfd3/scripts/run_nsys_profile.sh --output rfd3_profile -- python inference_script.py
-```
-
-Disable ranges while keeping Nsight capture:
-
-```bash
-bash models/rfd3/scripts/run_nsys_profile.sh --trace false --output rfd3_no_nvtx -- python inference_script.py
-```
-
-Enable low-memory mode during profiling:
-
-```bash
-bash models/rfd3/scripts/run_nsys_profile.sh --low-mem 1 --output rfd3_lowmem -- python inference_script.py
-```
-
-Manual command:
-
-```bash
-RFD3_TRACE_NVTX=true \
-RFD3_PROFILE_SYNC=false \
-nsys profile -o rfd3_profile --trace=cuda,nvtx,osrt python inference_script.py
 ```
 
 ## Reading Results In Nsight Systems
