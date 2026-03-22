@@ -648,7 +648,8 @@ class LocalTokenTransformer(nn.Module):
                     S_I,
                     Z_II,
                     indices=indices,
-                    full=full,  # (self.training and torch.is_grad_enabled()),  # Does not accelerate inference, but memory *does* scale better
+                    # full is controlled by caller (RFD3_LOW_MEMORY_MODE), not strictly by train/eval mode.
+                    full=full,
                     trace_prefix=f"RFD3/DiffusionModule/DiffusionTransformer/Block_{i}",
                 )
 

@@ -414,7 +414,8 @@ def sparse_pairbias_attention(
         k = indices.shape[-1]  # k_neigh
 
     if full:
-        # During training, compute full attention matrix to create a more optimized torch.tensor graph.
+        # Dense full-attention path selected by the caller when full=True.
+        # In this codebase, inference can also take this path when low-memory mode is disabled.
         with trace_range("RFD3/Layers/PairBiasAttention/FullAttention"):
             return pairbias_attention_(
                 Q=Q,
