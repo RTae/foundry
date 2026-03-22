@@ -15,7 +15,7 @@ Options:
   -h, --help            Show this help
 
 Examples:
-  run_nsys_profile.sh --output rfd3_profile -- python inference_script.py
+  run_nsys_profile.sh --output ./logs/nsys/rfd3_common_sim --sync true -- rfd3 design out_dir=logs/inference_outs/common_sim/0 inputs=models/rfd3/docs/examples/common_simulate.json skip_existing=False dump_trajectories=False prevalidate_inputs=False
   run_nsys_profile.sh --trace false -- python inference_script.py
 EOF
 }
@@ -81,7 +81,7 @@ NSYS_ARGS=(
   -o "$OUTPUT"
   --force-overwrite=true
   --sample=none
-  --trace=cuda,nvtx,osrt
+  --trace=cuda,nvtx,osrt,cublas,cudnn
   --cuda-memory-usage=true
 )
 
