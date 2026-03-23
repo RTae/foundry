@@ -152,7 +152,7 @@ This diagram is a runtime control-flow view. It emphasizes loop boundaries, stag
 ## Module breakdown (encoder, transformer, decoder)
 ```mermaid
 flowchart LR
-   In[f, X_t, t, initializer outputs] --> Prep[Time + preprocessing\nFourierEmbedding, process_r/c, pool/downcast]
+   In[f, X_t, t, initializer outputs] --> Prep[Time + preprocessing\nFourierEmbedding, process_r/c, token pooling/projection]
    Prep --> Loop{{Recycle loop\nfor i in n_recycle}}
 
    subgraph Core[Core model path]
@@ -161,7 +161,7 @@ flowchart LR
       TOK[Token encoder\nDiffusionTokenEncoder]
       PFB[PairformerBlock stack\ninside DiffusionTokenEncoder]
       TR[Transformer\nLocalTokenTransformer]
-      DEC[Decoder\nCompactStreamingDecoder]
+      DEC[Decoder\nCompactStreamingDecoder\nUpcast -> AtomTransformer -> Downcast]
       HD[Heads\nposition, sequence, distogram]
       ENC --> TOK --> PFB --> TR --> DEC --> HD
    end
@@ -171,9 +171,6 @@ flowchart LR
 
    IDX[create_attention_indices] -. sparse/local indices .-> ENC
    IDX -. sparse/local indices .-> TR
-
-   GCA[GatedCrossAttention] -. used in upcast/downcast .-> DEC
-   CFG[default config: upcast/downcast = cross_attention] --> GCA
 
    HD --> Xout[final X_L]
    HD --> Sout[final sequence outputs]
@@ -191,8 +188,8 @@ This module-level diagram maps directly to code in `RFD3_diffusion_module.py`, `
 
 Attention mapping in code:
 - `GatedCrossAttention`: [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L92)
-- `Upcast` cross-attention path: [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L478)
-- `Downcast` cross-attention path: [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L532)
+- `Decoder Upcast` cross-attention path: [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L478)
+- `Decoder Downcast` cross-attention path: [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L532)
 - `LocalAttentionPairBias` and sparse attention path: [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L198)
 - `create_attention_indices`: [models/rfd3/src/rfd3/model/layers/block_utils.py](models/rfd3/src/rfd3/model/layers/block_utils.py#L179)
 - `PairformerBlock` implementation used by token encoding: [models/rfd3/src/rfd3/model/layers/pairformer_layers.py](models/rfd3/src/rfd3/model/layers/pairformer_layers.py#L100)
