@@ -152,32 +152,28 @@ This diagram is a runtime control-flow view. It emphasizes loop boundaries, stag
 ## Module breakdown (encoder, transformer, decoder)
 ```mermaid
 flowchart LR
-   In[f, X_t, t, initializer outputs] --> Prep[Time + preprocessing\nFourierEmbedding, process_r/c, token pooling/projection]
-   Prep --> Loop{{Recycle loop\nfor i in n_recycle}}
+   subgraph Outer[Denoising loop over timesteps]
+      IN[Inputs f, X_t, t] --> Prep[Time preprocessing\nFourierEmbedding, process_r/c, token pooling/projection]
+      Prep --> ENC
 
-   subgraph Core[Core model path]
-      direction LR
-      ENC[Encoder\nLocalAtomTransformer]
-      TOK[Token encoder\nDiffusionTokenEncoder + Pairformer stack]
-      TR[Token transformer\nLocalTokenTransformer]
-      DEC[Decoder\nCompactStreamingDecoder\nn_blocks: Upcast then AtomTransformer\nthen Downcast once]
-      HD[Heads\nto_r_update + LinearSequenceHead + distogram bucketizer]
-      ENC --> TOK --> TR --> DEC --> HD
+      subgraph Inner[Recycle loop inside one timestep]
+         direction LR
+         ENC[Encoder\nLocalAtomTransformer]
+         TOK[Token encoder\nDiffusionTokenEncoder + Pairformer stack]
+         TR[Token transformer\nLocalTokenTransformer]
+         DEC[Decoder\nCompactStreamingDecoder\nn_blocks: Upcast then AtomTransformer\nthen Downcast once]
+         HD[Heads\nto_r_update + LinearSequenceHead + distogram bucketizer]
+         ENC --> TOK --> TR --> DEC --> HD --> ENC
+      end
+
+      HD --> Xout[Updated X + sequence + distogram]
+      Xout --> SAMP[Sampler step\nt -> t-1, CFG, symmetry]
+      SAMP --> Prep
+      SAMP --> OUT[Final outputs when schedule ends]
    end
-
-   Loop --> ENC
-   HD --> Loop
-
-   IDX_a[create_attention_indices atom path] --> ENC
-   IDX_a --> DEC
-   IDX_t[create_attention_indices token path per recycle] --> TR
-
-   HD --> Xout[final X_L]
-   HD --> Sout[final sequence outputs]
-   HD --> Dout[final D_II_self]
 ```
 
-Legend: arrows show data/attention index flow; all are solid for GitHub Mermaid compatibility.
+Legend: Outer subgraph = denoising timesteps; Inner subgraph = recycle iterations within one timestep. Arrows show data and attention-index flow.
 
 This module-level diagram aligns with `RFD3_diffusion_module.py`, `layers/encoders.py`, and `layers/blocks.py`:
 - `DiffusionTokenEncoder` mixes token/pairwise features, appends optional distogram + self-conditioning, and runs its internal `PairformerBlock` stack before returning `S_I, Z_II`.
