@@ -168,16 +168,16 @@ flowchart LR
    Loop --> ENC
    HD --> Loop
 
-   IDX_a[create_attention_indices (atom path)] -.-> ENC
-   IDX_a -.-> DEC
-   IDX_t[create_attention_indices (token path per recycle)] -.-> TR
+   IDX_a[create_attention_indices atom path] --> ENC
+   IDX_a --> DEC
+   IDX_t[create_attention_indices token path per recycle] --> TR
 
    HD --> Xout[final X_L]
    HD --> Sout[final sequence outputs]
    HD --> Dout[final D_II_self]
 ```
 
-Legend: solid arrows are main data flow; dashed arrows are attention-control paths.
+Legend: arrows show data/attention index flow; all are solid for GitHub Mermaid compatibility.
 
 This module-level diagram aligns with `RFD3_diffusion_module.py`, `layers/encoders.py`, and `layers/blocks.py`:
 - `DiffusionTokenEncoder` mixes token/pairwise features, appends optional distogram + self-conditioning, and runs its internal `PairformerBlock` stack before returning `S_I, Z_II`.
