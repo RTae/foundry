@@ -215,6 +215,33 @@ This module-level diagram maps directly to code in `RFD3_diffusion_module.py`, `
    - Sparse neighbor indices are built by `create_attention_indices` in [models/rfd3/src/rfd3/model/layers/block_utils.py](models/rfd3/src/rfd3/model/layers/block_utils.py#L179).
    - These indices are consumed in the diffusion module path in [models/rfd3/src/rfd3/model/RFD3_diffusion_module.py](models/rfd3/src/rfd3/model/RFD3_diffusion_module.py#L200).
 
+### Attention path diagram
+```mermaid
+flowchart LR
+   subgraph Runtime[Diffusion runtime]
+      direction LR
+      IDX[create_attention_indices] --> LAPB[LocalAttentionPairBias]
+      LAPB --> LAT[LocalAtomTransformer blocks]
+      IDX --> LTT[LocalTokenTransformer blocks]
+   end
+
+   subgraph CrossAttn[Cross-attention path]
+      direction LR
+      GCA[GatedCrossAttention] --> UP[Upcast method cross_attention]
+      GCA --> DOWN[Downcast method cross_attention]
+   end
+
+   UP --> DEC[CompactStreamingDecoder]
+   DOWN --> DEC
+
+   CFG[Default config rfd3_net.yaml] --> UP
+   CFG --> DOWN
+```
+
+Interpretation:
+- Sparse/local attention controls neighborhood-limited message passing in atom/token transformer blocks.
+- Cross-attention is used at atom-token exchange points (upcast/downcast), especially in decoder flow.
+
 ## Detailed execution order (single diffusion step)
 1. Build conditioning and geometry inputs:
    - `f` carries token/atom mappings, masks, motif constraints, symmetry metadata, and optional conditioning features.
