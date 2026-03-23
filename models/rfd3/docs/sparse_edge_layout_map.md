@@ -139,3 +139,57 @@ Together, these define:
 - the sparse edge feature consumption
 
 That is enough to evaluate whether a persistent sparse neighborhood workspace improves locality and reduces repeated memory traffic before deciding which kernels are worth fusing.
+
+## Capturing Matrix Structure During Inference
+
+If you want to inspect how the matrices look during a real inference run, you can now capture them directly from the model path.
+
+Set:
+
+```bash
+RFD3_CAPTURE_MATRIX_DIR=/tmp/rfd3_matrix_capture
+```
+
+and run inference as usual. The capture is one-shot and writes:
+
+1. `attention_indices.pt`
+  Contains the real sparse neighborhood tensor `indices` used by attention.
+
+2. `pairwise_initializer.pt`
+  Contains the dense initializer-side pair structure from the standard path:
+  - `motif_valid_mask`
+  - `ref_valid_mask`
+  - `pair_energy` as `||P_LL||` over the feature dimension
+  - `pair_nonzero_mask`
+  - `token_index`
+
+Example:
+
+```bash
+RFD3_CAPTURE_MATRIX_DIR=./logs/rfd3_matrix_capture \
+rfd3 design out_dir=logs/inference_outs/common_sim_capture/0 \
+inputs=models/rfd3/docs/examples/common_simulate.json \
+diffusion_batch_size=1 n_batches=1 \
+skip_existing=False dump_trajectories=False prevalidate_inputs=False
+```
+
+This lets you analyze both:
+
+1. the sparse attention structure that is repeatedly consumed
+2. the dense pairwise structure that is precomputed and kept alive in the standard path
+
+You can then visualize the captured sparse structure with:
+
+```bash
+python models/rfd3/scripts/visualize_sparse_layout.py \
+   ./logs/rfd3_matrix_capture/attention_indices.pt \
+   ./logs/rfd3_matrix_capture/rfd3_sparse_layout.svg
+```
+
+PNG is also supported:
+
+```bash
+python models/rfd3/scripts/visualize_sparse_layout.py \
+  ./logs/rfd3_matrix_capture/attention_indices.pt \
+  ./logs/rfd3_matrix_capture/rfd3_sparse_layout.png
+```

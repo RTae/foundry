@@ -16,6 +16,7 @@ from rfd3.model.layers.layer_utils import (
     RMSNorm,
     linearNoBias,
 )
+from rfd3.utils.matrix_capture import capture_attention_indices
 from rfd3.utils.tracing import trace_range
 
 from foundry.common import exists
@@ -271,6 +272,7 @@ class LocalAttentionPairBias(nn.Module):
                     n_attn_seq_neighbours=self.n_attn_seq_neighbours,
                     X_L=X_L,
                 )
+            capture_attention_indices(indices)
 
         # Handle chunked P_LL computation
         with trace_range("RFD3/Layers/LocalAttentionPairBias/PairFeaturePrep"):

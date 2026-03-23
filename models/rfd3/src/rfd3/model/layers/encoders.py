@@ -26,6 +26,7 @@ from rfd3.model.layers.layer_utils import (
     linearNoBias,
 )
 from rfd3.model.layers.pairformer_layers import PairformerBlock
+from rfd3.utils.matrix_capture import capture_pairwise_initializer_structure
 from rfd3.utils.tracing import trace_range
 
 from foundry.common import exists
@@ -253,12 +254,12 @@ class TokenInitializer(nn.Module):
                 # Original full P_LL computation
                 with trace_range("RFD3/TokenInitializer/PairwiseEmbedding"):
                     # Embed motif coordinates
-                    valid_mask = (
+                    motif_valid_mask = (
                         f["is_motif_atom_with_fixed_coord"].unsqueeze(-1)
                         & f["is_motif_atom_with_fixed_coord"].unsqueeze(-2)
                     ).unsqueeze(-1)
                     P_LL = self.motif_pos_embedder(
-                        f["motif_pos"], valid_mask
+                        f["motif_pos"], motif_valid_mask
                     )  # (L, L, c_atompair)
 
                     # Embed ref pos
@@ -270,8 +271,8 @@ class TokenInitializer(nn.Module):
                         f["is_motif_atom_with_fixed_seq"].unsqueeze(-1)
                         & f["is_motif_atom_with_fixed_seq"].unsqueeze(-2)
                     ).unsqueeze(-1)
-                    valid_mask = atoms_in_same_token & atoms_has_seq
-                    P_LL = P_LL + self.ref_pos_embedder(f["ref_pos"], valid_mask)
+                    ref_valid_mask = atoms_in_same_token & atoms_has_seq
+                    P_LL = P_LL + self.ref_pos_embedder(f["ref_pos"], ref_valid_mask)
 
                     P_LL = P_LL + (
                         self.process_single_l(C_L).unsqueeze(-2)
@@ -283,6 +284,12 @@ class TokenInitializer(nn.Module):
                     )
                     P_LL = P_LL + self.pair_mlp(P_LL)
                     P_LL = P_LL.contiguous()
+                    capture_pairwise_initializer_structure(
+                        p_ll=P_LL,
+                        motif_valid_mask=motif_valid_mask,
+                        ref_valid_mask=ref_valid_mask,
+                        tok_idx=tok_idx,
+                    )
 
                 with trace_range("RFD3/TokenInitializer/PoolPairwiseToToken"):
                     # Pool P_LL to token level to provide atom-level resolution for token track
