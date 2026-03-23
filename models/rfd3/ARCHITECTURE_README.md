@@ -168,9 +168,9 @@ flowchart LR
    Loop --> ENC
    HD --> Loop
 
-   IDX_a[create_attention_indices<br/>(atom path)] -.-> ENC
+   IDX_a[create_attention_indices (atom path)] -.-> ENC
    IDX_a -.-> DEC
-   IDX_t[create_attention_indices<br/>(token path, per recycle)] -.-> TR
+   IDX_t[create_attention_indices (token path per recycle)] -.-> TR
 
    HD --> Xout[final X_L]
    HD --> Sout[final sequence outputs]
