@@ -158,19 +158,19 @@ flowchart LR
    subgraph Core[Core model path]
       direction LR
       ENC[Encoder\nLocalAtomTransformer]
-      TOK[Token encoder\nDiffusionTokenEncoder]
-      PFB[PairformerBlock stack\ninside DiffusionTokenEncoder]
-      TR[Transformer\nLocalTokenTransformer]
-      DEC[Decoder\nCompactStreamingDecoder\nUpcast -> AtomTransformer -> Downcast]
-      HD[Heads\nposition, sequence, distogram]
-      ENC --> TOK --> PFB --> TR --> DEC --> HD
+      TOK[Token encoder\nDiffusionTokenEncoder\n(+ Pairformer stack)]
+      TR[Token transformer\nLocalTokenTransformer]
+      DEC[Decoder\nCompactStreamingDecoder\nn_blocks x (Upcast -> AtomTransformer)\nthen Downcast (once)]
+      HD[Heads\nto_r_update + LinearSequenceHead + distogram bucketizer]
+      ENC --> TOK --> TR --> DEC --> HD
    end
 
    Loop --> ENC
    HD --> Loop
 
-   IDX[create_attention_indices] -. sparse/local indices .-> ENC
-   IDX -. sparse/local indices .-> TR
+   IDX_a[create_attention_indices\n(atom path)] -. sparse/local indices .-> ENC
+   IDX_a -. reused by decoder .-> DEC
+   IDX_t[create_attention_indices\n(token path, per recycle)] -. local CA indices .-> TR
 
    HD --> Xout[final X_L]
    HD --> Sout[final sequence outputs]
@@ -179,12 +179,12 @@ flowchart LR
 
 Legend: solid arrows are main data flow; dashed arrows are attention-control paths.
 
-This module-level diagram maps directly to code in `RFD3_diffusion_module.py`, `layers/encoders.py`, and `layers/blocks.py`:
-- `DiffusionTokenEncoder` mixes token and pairwise features, including optional distogram/self-conditioning paths.
-- `PairformerBlock` stack runs inside `DiffusionTokenEncoder` before the token transformer stage.
-- `LocalTokenTransformer` applies repeated token-level attention blocks over local neighborhoods.
-- `CompactStreamingDecoder` alternates upcast/atom-transformer updates and downcasts back to token space.
-- Output heads produce coordinates, sequence outputs, and recycle memory (`D_II_self`).
+This module-level diagram aligns with `RFD3_diffusion_module.py`, `layers/encoders.py`, and `layers/blocks.py`:
+- `DiffusionTokenEncoder` mixes token/pairwise features, appends optional distogram + self-conditioning, and runs its internal `PairformerBlock` stack before returning `S_I, Z_II`.
+- `LocalTokenTransformer` builds fresh CA-based attention indices each recycle (it does not reuse `f["attn_indices"]`) and updates `A_I` with local or full attention depending on `RFD3_LOW_MEMORY_MODE`.
+- `CompactStreamingDecoder` loops `n_blocks` times over `Upcast -> StructureLocalAtomTransformerBlock`; it performs **one** `Downcast` afterward (on detached `Q_L`, `A_I`, `S_I`) to refresh token features for heads/recycling.
+- Output heads live in `RFD3DiffusionModule.process_`: `to_r_update` + `scale_positions_out` for coordinates, `LinearSequenceHead` for logits/indices, and `bucketize_scaled_distogram` for `D_II_self`.
+- When `RFD3_LOW_MEMORY_MODE=1`, encoder/decoder use `chunked_pairwise_embedder`; otherwise they consume full `P_LL`.
 
 Attention mapping in code:
 - `GatedCrossAttention`: [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L92)
@@ -211,12 +211,10 @@ Attention mapping in code:
    - `DiffusionTokenEncoder` fuses token states with pairwise/context and current coordinates.
    - `LocalTokenTransformer` performs token-level attention updates.
 6. Decode and project outputs:
-   - `CompactStreamingDecoder` mixes token and atom streams back into refined atom states.
-   - Position head (`to_r_update`) predicts coordinate delta; sequence head predicts token logits.
-   - Distogram head produces `D_II_self` for recycle context.
+   - `CompactStreamingDecoder` runs `n_blocks` of [Upcast -> `StructureLocalAtomTransformerBlock`], then a single `Downcast` (detached) to refresh `A_I`.
+   - Heads in `RFD3DiffusionModule.process_`: `to_r_update` + `scale_positions_out` -> `X_out_L`; `LinearSequenceHead` -> logits/indices; distogram bucketization -> `D_II_self`.
 7. Recycle boundary:
-   - `scale_positions_out` returns updated coordinates `X_L`.
-   - (`X_L`, `D_II_self`) are fed into the next recycle iteration when `n_recycle > 0`.
+   - (`X_out_L`, `D_II_self`) are fed into the next recycle iteration when `n_recycle > 0`.
 8. Sampler update:
    - `InferenceSampler` applies schedule logic (EDM-style), optional CFG blending, and optional symmetry constraints to produce the next step state.
 
