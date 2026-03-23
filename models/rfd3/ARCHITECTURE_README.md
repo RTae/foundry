@@ -159,10 +159,11 @@ flowchart LR
       direction LR
       ENC[Encoder\nLocalAtomTransformer]
       TOK[Token encoder\nDiffusionTokenEncoder]
+      PFB[PairformerBlock stack\ninside DiffusionTokenEncoder]
       TR[Transformer\nLocalTokenTransformer]
       DEC[Decoder\nCompactStreamingDecoder]
       HD[Heads\nposition, sequence, distogram]
-      ENC --> TOK --> TR --> DEC --> HD
+      ENC --> TOK --> PFB --> TR --> DEC --> HD
    end
 
    Loop --> ENC
@@ -183,6 +184,7 @@ Legend: solid arrows are main data flow; dashed arrows are attention-control pat
 
 This module-level diagram maps directly to code in `RFD3_diffusion_module.py`, `layers/encoders.py`, and `layers/blocks.py`:
 - `DiffusionTokenEncoder` mixes token and pairwise features, including optional distogram/self-conditioning paths.
+- `PairformerBlock` stack runs inside `DiffusionTokenEncoder` before the token transformer stage.
 - `LocalTokenTransformer` applies repeated token-level attention blocks over local neighborhoods.
 - `CompactStreamingDecoder` alternates upcast/atom-transformer updates and downcasts back to token space.
 - Output heads produce coordinates, sequence outputs, and recycle memory (`D_II_self`).
@@ -193,6 +195,7 @@ Attention mapping in code:
 - `Downcast` cross-attention path: [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L532)
 - `LocalAttentionPairBias` and sparse attention path: [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L198)
 - `create_attention_indices`: [models/rfd3/src/rfd3/model/layers/block_utils.py](models/rfd3/src/rfd3/model/layers/block_utils.py#L179)
+- `PairformerBlock` implementation used by token encoding: [models/rfd3/src/rfd3/model/layers/pairformer_layers.py](models/rfd3/src/rfd3/model/layers/pairformer_layers.py#L100)
 - Default cross-attention config for upcast/downcast: [models/rfd3/configs/model/components/rfd3_net.yaml](models/rfd3/configs/model/components/rfd3_net.yaml#L67) and [models/rfd3/configs/model/components/rfd3_net.yaml](models/rfd3/configs/model/components/rfd3_net.yaml#L76)
 
 ## Detailed execution order (single diffusion step)
