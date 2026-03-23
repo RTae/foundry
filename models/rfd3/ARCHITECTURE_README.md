@@ -88,47 +88,42 @@ flowchart TD
 
 ## Model architecture
 ```mermaid
-flowchart LR
-    subgraph Inputs
-        f[features f: masks, symmetry, conditioning]
-      Xt[X_t noisy coordinates]
-        t[timestep]
-    end
+flowchart TB
+   subgraph DenoisingLoop[Outer denoising loop over timesteps]
+      direction LR
+      StepIn[X_t and t and f] --> Init[TokenInitializer]
+      Init --> CoreIn[DiffusionModule input state]
 
-   f & Xt & t --> TI[TokenInitializer\nQ_L,C_L,P_LL,S_I,Z_II]
-   TI --> DM[RFD3DiffusionModule]
+      subgraph RecycleLoop[Inner recycle loop inside DiffusionModule]
+         direction LR
+         CoreIn --> Block1[Atom encoder block\nLocalAtomTransformer]
+         Block1 --> Block2[Token encoder block\nDiffusionTokenEncoder]
+         Block2 --> Block3[Token transformer block\nLocalTokenTransformer]
+         Block3 --> Block4[Decoder block\nCompactStreamingDecoder]
+         Block4 --> Heads[Heads\nto_r_update and sequence_head\nbucketize D_II_self]
+         Heads --> RecycleGate{More recycle iterations?}
+         RecycleGate -- yes --> Block1
+         RecycleGate -- no --> CoreOut[Recycle complete]
+      end
 
-   DM --> Seq[sequence_head\nsequence_logits and sequence_indices]
-   DM --> Dist[distogram buckets\nD_II_self]
-   DM --> ScaleOut[scale_positions_out\nX_L]
+      CoreOut --> Scale[scale_positions_out]
+      Scale --> Xt1[Estimated X_t-1]
+      Xt1 --> SamplerStep[Sampler transition\nEDM schedule + CFG + symmetry]
+      SamplerStep --> StepOut[Next state X_t-1]
+      StepOut --> Continue{More diffusion steps?}
+      Continue -- yes --> StepIn
+      Continue -- no --> Output[Final structures and metadata]
+   end
 
-   ScaleOut --> Xt1[Estimated X_t-1]
-   ScaleOut --> Recycle{{Recycle n times inside module}}
-    Dist --> Recycle
-   Recycle --> DM
-
-   Xt1 --> SamplerStep[Sampler transition\nEDM schedule, CFG, symmetry]
-   SamplerStep --> Next[Next diffusion state]
-   Next --> Output[Structures + metadata]
-
-   subgraph Optional CFG pass
+   subgraph OptionalCFG[Optional CFG reference pass]
       CFGstrip[strip f by cfg_features]
-      CFGstrip --> TI2["TokenInitializer (ref)"] --> LAT2["ref forward"]
+      CFGstrip --> RefInit[TokenInitializer ref]
+      RefInit --> RefForward[Reference forward pass]
    end
-   SamplerStep -. blends .- TI2
-
-   subgraph DiffusionModule side zoom
-      DMA[Atom encoder\nLocalAtomTransformer]
-      DMB[Token encoder\nDiffusionTokenEncoder]
-      DMC[Token transformer\nLocalTokenTransformer]
-      DMD[Decoder\nCompactStreamingDecoder]
-      DME[Heads\nto_r_update and sequence_head and bucketize]
-      DMA --> DMB --> DMC --> DMD --> DME
-   end
-   DM -. expanded at right .- DMA
+   SamplerStep -. blends with ref .- RefForward
 ```
 
-Key signals: `f` (conditioning features), `X_t` (coordinates at current step), `t` (noise level). The recycle loop re-feeds updated positions and pairwise buckets to the encoder/decoder stack for iterative refinement.
+Key signals: `f` (conditioning features), `X_t` (coordinates at current step), `t` (noise level). The inner recycle loop refines within one timestep, while the outer denoising loop advances from `X_t` to `X_t-1` until sampling completes.
 
 ## Module breakdown (encoder, transformer, decoder)
 ```mermaid
