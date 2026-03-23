@@ -2,6 +2,11 @@
 
 This document summarizes how the RFD3 model in `models/rfd3` is organized and how inference/training flow through the codebase.
 
+The structure of this document is intentionally top-down:
+1. Start with a high-level block diagram.
+2. Move to the denoising/recycling control flow.
+3. Drill into module internals and per-step execution details.
+
 ## High-level purpose
 RFD3 is an AlphaFold3-inspired diffusion model for de novo biomolecular interaction design. It denoises atom-level coordinates while optionally predicting sequences, supporting diverse conditioning tasks (motifs, nucleic acids, small molecules, symmetry, etc.).
 
@@ -28,6 +33,10 @@ RFD3 is an AlphaFold3-inspired diffusion model for de novo biomolecular interact
    - Initializes noisy structure (motif atoms can be kept fixed; optional jitter).
    - Steps through schedule calling diffusion module; supports classifier-free guidance and symmetry handling.
    - Optionally realigns motif each step and collects trajectories/entropy.
+
+Conceptually, one inference run has two nested loops:
+- **Outer loop (denoising timesteps)**: advances structure from higher noise to lower noise.
+- **Inner loop (recycling)**: refines predictions multiple times at a single timestep.
 
 ## Model core (`model/RFD3.py` + `model/RFD3_diffusion_module.py`)
 - **TokenInitializer**: builds initial per-atom (`Q_L`, `C_L`, pairwise `P_LL`) and per-token (`S_I`, `Z_II`) features from parsed inputs (`f`). Supports chunked pairwise mode (`RFD3_LOW_MEMORY_MODE=1`).
@@ -88,44 +97,57 @@ flowchart LR
 
 This top-level diagram is intentionally block-oriented. The next sections break down each module in detail.
 
-## Model architecture
-```mermaid
-flowchart TB
-   subgraph DenoisingLoop[Outer denoising loop over timesteps]
-      direction LR
-      StepIn[X_t and t and f] --> Init[TokenInitializer]
-      Init --> CoreIn[DiffusionModule input state]
+Reading guide for this diagram:
+- `Feature Initializer` prepares model state from parsed residue/atom features.
+- `Recycle Step` is the inner refinement loop (`Encoder -> Transformer -> Decoder -> Heads`).
+- `Denoising Step` performs one transition from `X_t` to `X_t-1`.
+- `Sampler Step` advances the schedule and decides whether another timestep is needed.
 
-      subgraph RecycleLoop[Inner recycle loop inside DiffusionModule]
+## Bridge: from overview to internals
+The overview above tells you **what** happens in broad blocks. The next diagram shows **how** one denoising step executes in the model runtime:
+- Stage A: initialize state from `f` and timestep inputs.
+- Stage B: run recycle iterations (`encoder -> token encoder -> transformer -> decoder -> heads`).
+- Stage C: produce `X_t-1` and auxiliary predictions.
+- Stage D: sampler decides whether to continue to the next timestep.
+
+## Model runtime flow (detailed control flow)
+```mermaid
+flowchart LR
+   subgraph OuterLoop[Outer loop: denoising timesteps]
+      direction LR
+      A0[Step input\nX_t + t + f] --> A1[Stage A\nTokenInitializer]
+      A1 --> B0[Stage B entry\nDiffusionModule state]
+
+      subgraph InnerLoop[Inner loop: recycle iterations]
          direction LR
-         CoreIn --> Block1[Atom encoder block\nLocalAtomTransformer]
-         Block1 --> Block2[Token encoder block\nDiffusionTokenEncoder]
-         Block2 --> Block3[Token transformer block\nLocalTokenTransformer]
-         Block3 --> Block4[Decoder block\nCompactStreamingDecoder]
-         Block4 --> Heads[Heads\nto_r_update and sequence_head\nbucketize D_II_self]
-         Heads --> RecycleGate{More recycle iterations?}
-         RecycleGate -- yes --> Block1
-         RecycleGate -- no --> CoreOut[Recycle complete]
+         B0 --> B1[Atom encoder\nLocalAtomTransformer]
+         B1 --> B2[Token encoder\nDiffusionTokenEncoder]
+         B2 --> B3[Token transformer\nLocalTokenTransformer]
+         B3 --> B4[Decoder\nCompactStreamingDecoder]
+         B4 --> B5[Heads\nto_r_update + sequence + distogram]
+         B5 --> BR{More recycle iterations?}
+         BR -- yes --> B1
+         BR -- no --> C0[Stage C entry\nrecycle complete]
       end
 
-      CoreOut --> Scale[scale_positions_out]
-      Scale --> Xt1[Estimated X_t-1]
-      Xt1 --> SamplerStep[Sampler transition\nEDM schedule + CFG + symmetry]
-      SamplerStep --> StepOut[Next state X_t-1]
-      StepOut --> Continue{More diffusion steps?}
-      Continue -- yes --> StepIn
-      Continue -- no --> Output[Final structures and metadata]
+      C0 --> C1[scale_positions_out]
+      C1 --> C2[Step output\nX_t-1 + D_II_self + sequence outputs]
+      C2 --> D1[Stage D\nSampler transition]
+      D1 --> D2{More denoising steps?}
+      D2 -- yes --> A0
+      D2 -- no --> Z[Final structures + metadata]
    end
 
-   subgraph OptionalCFG[Optional CFG reference pass]
-      CFGstrip[strip f by cfg_features]
-      CFGstrip --> RefInit[TokenInitializer ref]
-      RefInit --> RefForward[Reference forward pass]
+   subgraph CFG[Optional CFG reference path]
+      R0[strip f by cfg_features] --> R1[TokenInitializer ref]
+      R1 --> R2[Reference forward]
    end
-   SamplerStep -. blends with ref .- RefForward
+   D1 -. blends with .- R2
 ```
 
 Key signals: `f` (conditioning features), `X_t` (coordinates at current step), `t` (noise level). The inner recycle loop refines within one timestep, while the outer denoising loop advances from `X_t` to `X_t-1` until sampling completes.
+
+This diagram is a runtime control-flow view. It emphasizes loop boundaries, stage transitions, and where CFG blending enters the denoising step.
 
 ## Module breakdown (encoder, transformer, decoder)
 ```mermaid
@@ -175,32 +197,45 @@ flowchart TB
    H4 --> Dout[final D_II_self]
 ```
 
+This module-level diagram maps directly to code in `RFD3_diffusion_module.py`, `layers/encoders.py`, and `layers/blocks.py`:
+- `DiffusionTokenEncoder` mixes token and pairwise features, including optional distogram/self-conditioning paths.
+- `LocalTokenTransformer` applies repeated token-level attention blocks over local neighborhoods.
+- `CompactStreamingDecoder` alternates upcast/atom-transformer updates and downcasts back to token space.
+- Output heads produce coordinates, sequence outputs, and recycle memory (`D_II_self`).
+
 ## Detailed execution order (single diffusion step)
 1. Build conditioning and geometry inputs:
    - `f` carries token/atom mappings, masks, motif constraints, symmetry metadata, and optional conditioning features.
    - `X_t` and `t` define the current diffusion state.
 2. Run `TokenInitializer`:
    - Produces atom stream states (`Q_L`, `C_L`), atom-pair states (`P_LL`), and token stream states (`S_I`, `Z_II`).
-3. Run atom encoder path:
+3. Prepare timestep-conditioned states inside the diffusion module:
+   - Time embeddings are produced and injected into atom/token streams.
+   - Atom-level states are projected/pool-coupled into token-level states.
+4. Run atom encoder path:
    - `LocalAtomTransformer` updates atom-local context from neighborhood attention.
    - `Downcast` pools atom information into token-aligned channels.
-4. Run token encoder/transformer path:
+5. Run token encoder/transformer path:
    - `DiffusionTokenEncoder` fuses token states with pairwise/context and current coordinates.
    - `LocalTokenTransformer` performs token-level attention updates.
-5. Decode and project outputs:
+6. Decode and project outputs:
    - `CompactStreamingDecoder` mixes token and atom streams back into refined atom states.
    - Position head (`to_r_update`) predicts coordinate delta; sequence head predicts token logits.
    - Distogram head produces `D_II_self` for recycle context.
-6. Recycle boundary:
+7. Recycle boundary:
    - `scale_positions_out` returns updated coordinates `X_L`.
    - (`X_L`, `D_II_self`) are fed into the next recycle iteration when `n_recycle > 0`.
-7. Sampler update:
+8. Sampler update:
    - `InferenceSampler` applies schedule logic (EDM-style), optional CFG blending, and optional symmetry constraints to produce the next step state.
 
 ## Recycle state summary
 - Position state: `X_L` (updated coordinates after output scaling).
 - Pairwise memory: `D_II_self` (distogram buckets used as iterative context).
 - Conditioning state: `f` remains fixed unless explicitly modified by CFG feature stripping in the reference pass.
+
+Practical interpretation:
+- Recycling improves consistency at a fixed timestep before moving to the next denoising step.
+- Denoising changes the noise level (schedule step) and carries forward refined structure state.
 
 ## Quick references
 - Run inference: `rfd3 design out_dir=<dir> inputs=models/rfd3/docs/examples/demo.json dump_trajectories=True prevalidate_inputs=True`.
