@@ -86,9 +86,46 @@ flowchart TD
             metrics/logs]
 ```
 
+## Model architecture (component wiring)
+```mermaid
+flowchart LR
+    subgraph Inputs
+        f[features f: masks, symmetry, conditioning]
+        X0[noisy coords X_noisy_L]
+        t[timestep]
+    end
+
+    f & X0 & t --> TI[TokenInitializer\nQ_L,C_L,P_LL,\nS_I,Z_II]
+
+    TI --> LAT[LocalAtomTransformer]
+    LAT -->|pool/downcast| DTK[DiffusionTokenEncoder]
+    DTK --> LTT[LocalTokenTransformer]
+    LTT --> CSD[CompactStreamingDecoder]
+
+    CSD --> RU[to_r_update\nposition delta]
+    CSD --> SH[Sequence head\nlogits/indices]
+
+    RU --> ScaleOut[scale_positions_out\nX_L]
+    ScaleOut --> Recycle{{Recycle n times}}
+    Recycle --> LAT
+
+    CSD --> Dist[distogram buckets\nD_II_self]
+    Dist --> Recycle
+
+    ScaleOut --> Sampler[InferenceSampler\nEDM schedule, CFG]
+    Sampler --> Output[Structures + metadata]
+
+    subgraph Optional CFG pass
+        CFGstrip[strip f by cfg_features]
+        CFGstrip --> TI2[TokenInitializer (ref)] --> LAT2[ref forward]
+    end
+    Sampler -. blends .- TI2
+```
+
+Key signals: `f` (conditioning features), `X_noisy_L` (coordinates at step), `t` (noise level). The recycle loop re-feeds updated positions and pairwise buckets to the encoder/decoder stack for iterative refinement.
+
 ## Quick references
 - Run inference: `rfd3 design out_dir=<dir> inputs=models/rfd3/docs/examples/demo.json dump_trajectories=True prevalidate_inputs=True`.
 - Model toggle: set `RFD3_LOW_MEMORY_MODE=1` to enable chunked pairwise embeddings.
 - CFG features controlled via `inference_sampler.cfg_features` (see default list in `configs/inference_engine/rfdiffusion3.yaml`).
 - Symmetry sampler: `inference_sampler.kind=symmetry` plus symmetry spec in input JSON.
-
