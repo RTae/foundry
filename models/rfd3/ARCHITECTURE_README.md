@@ -86,16 +86,16 @@ flowchart TD
             metrics/logs]
 ```
 
-## Model architecture (component wiring)
+## Model architecture
 ```mermaid
 flowchart LR
     subgraph Inputs
         f[features f: masks, symmetry, conditioning]
-        X0[noisy coords X_noisy_L]
+      Xt[X_t noisy coordinates]
         t[timestep]
     end
 
-    f & X0 & t --> TI[TokenInitializer\nQ_L,C_L,P_LL,\nS_I,Z_II]
+   f & Xt & t --> TI[TokenInitializer\nQ_L,C_L,P_LL,\nS_I,Z_II]
 
     TI --> LAT[LocalAtomTransformer]
     LAT -->|pool/downcast| DTK[DiffusionTokenEncoder]
@@ -105,24 +105,54 @@ flowchart LR
     CSD --> RU[to_r_update\nposition delta]
     CSD --> SH[Sequence head\nlogits/indices]
 
-    RU --> ScaleOut[scale_positions_out\nX_L]
+      RU --> ScaleOut[scale_positions_out\nX_L]
+      ScaleOut --> Xt1[Estimated X_t-1]
     ScaleOut --> Recycle{{Recycle n times}}
     Recycle --> LAT
 
     CSD --> Dist[distogram buckets\nD_II_self]
     Dist --> Recycle
 
-    ScaleOut --> Sampler[InferenceSampler\nEDM schedule, CFG]
-    Sampler --> Output[Structures + metadata]
+      Xt1 --> SamplerStep[Sampler transition\nEDM schedule, CFG, symmetry]
+      SamplerStep --> Next[Next diffusion state]
+      Next --> Output[Structures + metadata]
 
       subgraph Optional CFG pass
          CFGstrip[strip f by cfg_features]
          CFGstrip --> TI2["TokenInitializer (ref)"] --> LAT2["ref forward"]
       end
-    Sampler -. blends .- TI2
+      SamplerStep -. blends .- TI2
 ```
 
-Key signals: `f` (conditioning features), `X_noisy_L` (coordinates at step), `t` (noise level). The recycle loop re-feeds updated positions and pairwise buckets to the encoder/decoder stack for iterative refinement.
+   Key signals: `f` (conditioning features), `X_t` (coordinates at current step), `t` (noise level). The recycle loop re-feeds updated positions and pairwise buckets to the encoder/decoder stack for iterative refinement.
+
+## Module breakdown (encoder, transformer, decoder)
+```mermaid
+flowchart LR
+   In[f, X_noisy_L, t] --> TI[TokenInitializer\nQ_L,C_L,P_LL,S_I,Z_II]
+
+   subgraph Encoder
+      LAT[LocalAtomTransformer]
+      Down[Downcast atom -> token]
+      DTK[DiffusionTokenEncoder]
+   end
+
+   subgraph Transformer
+      LTT[LocalTokenTransformer]
+   end
+
+   subgraph Decoder
+      CSD[CompactStreamingDecoder]
+      RU[to_r_update]
+      SH[Sequence head]
+      DH[Distogram head]
+   end
+
+   TI --> LAT --> Down --> DTK --> LTT --> CSD
+   CSD --> RU --> Xout[Updated coordinates X_L]
+   CSD --> SH --> Sout[Token logits]
+   CSD --> DH --> Dout[D_II_self]
+```
 
 ## Detailed execution order (single diffusion step)
 1. Build conditioning and geometry inputs:
