@@ -160,7 +160,7 @@ flowchart LR
       ENC[Encoder\nLocalAtomTransformer]
       TOK[Token encoder\nDiffusionTokenEncoder + Pairformer stack]
       TR[Token transformer\nLocalTokenTransformer]
-      DEC[Decoder\nCompactStreamingDecoder\nn_blocks: Upcast -> AtomTransformer\nthen Downcast once]
+      DEC[Decoder\nCompactStreamingDecoder\nn_blocks: Upcast then AtomTransformer\nthen Downcast once]
       HD[Heads\nto_r_update + LinearSequenceHead + distogram bucketizer]
       ENC --> TOK --> TR --> DEC --> HD
    end
