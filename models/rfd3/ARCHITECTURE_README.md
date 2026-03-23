@@ -151,73 +151,35 @@ This diagram is a runtime control-flow view. It emphasizes loop boundaries, stag
 
 ## Module breakdown (encoder, transformer, decoder)
 ```mermaid
-flowchart TB
-   In[f, X_t, t plus initializer outputs] --> Time[Time processing\nFourierEmbedding x2 -> process_n]
-   Time --> ProcR[process_r and process_c\nplus downcast_c and process_a]
-   ProcR --> RecycleLoop{{for i in n_recycle}}
+flowchart LR
+   In[f, X_t, t, initializer outputs] --> Prep[Time + preprocessing\nFourierEmbedding, process_r/c, pool/downcast]
+   Prep --> Loop{{Recycle loop\nfor i in n_recycle}}
 
-   ProcR --> IDX[create_attention_indices]
-
-   RecycleLoop --> AENC
-
-   subgraph AENC[LocalAtomTransformer encoder]
-      LAPB["LocalAttentionPairBias\n(sparse or local pair-bias attention)"]
-      ABLK[n_blocks x StructureLocalAtomTransformerBlock]
-      LAPB --> ABLK
+   subgraph Core[Core model path]
+      direction LR
+      ENC[Encoder\nLocalAtomTransformer]
+      TOK[Token encoder\nDiffusionTokenEncoder]
+      TR[Transformer\nLocalTokenTransformer]
+      DEC[Decoder\nCompactStreamingDecoder]
+      HD[Heads\nposition, sequence, distogram]
+      ENC --> TOK --> TR --> DEC --> HD
    end
 
-   IDX --> LAPB
+   Loop --> ENC
+   HD --> Loop
 
-   AENC --> DTE
-   subgraph DTE[DiffusionTokenEncoder]
-      DTE1[transition_1 x2 on S_I]
-      DTE2[distogram processing\nuse_distogram plus use_self]
-      DTE3[process_z -> transition_2 x2]
-      DTE4[pairformer_stack n_pairformer_blocks]
-      DTE1 --> DTE2 --> DTE3 --> DTE4
-   end
+   IDX[create_attention_indices] -. sparse/local indices .-> ENC
+   IDX -. sparse/local indices .-> TR
 
-   DTE --> LTT
-   subgraph LTT[LocalTokenTransformer]
-      LTT0[attention indices input]
-      LTT1[n_block x StructureLocalAtomTransformerBlock]
-      LTT0 --> LTT1
-   end
+   GCA[GatedCrossAttention] -. used in upcast/downcast .-> DEC
+   CFG[default config: upcast/downcast = cross_attention] --> GCA
 
-   IDX --> LTT0
-
-   LTT --> DEC
-   subgraph DEC[CompactStreamingDecoder]
-      DEC1[per block: Upcast]
-      DEC2[per block: AtomTransformer block]
-      DEC3[Downcast detached back to A_I]
-      DEC1 --> DEC2 --> DEC3
-   end
-
-   subgraph XATTN[Cross-attention bridges]
-      GCA[GatedCrossAttention]
-      CFG[default config\nupcast and downcast method = cross_attention]
-      CFG --> GCA
-   end
-
-   GCA -. used by .-> DEC1
-   GCA -. used by .-> DEC3
-
-   DEC --> Heads
-   subgraph Heads[Output heads]
-      H1[to_r_update = RMSNorm + Linear]
-      H2[scale_positions_out -> X_L]
-      H3[sequence_head -> logits and indices]
-      H4[bucketize_fn on CA -> D_II_self]
-      H1 --> H2
-      H2 --> H4
-   end
-
-   Heads --> RecycleLoop
-   H2 --> Xout[final X_L]
-   H3 --> Sout[final sequence outputs]
-   H4 --> Dout[final D_II_self]
+   HD --> Xout[final X_L]
+   HD --> Sout[final sequence outputs]
+   HD --> Dout[final D_II_self]
 ```
+
+Legend: solid arrows are main data flow; dashed arrows are attention-control paths.
 
 This module-level diagram maps directly to code in `RFD3_diffusion_module.py`, `layers/encoders.py`, and `layers/blocks.py`:
 - `DiffusionTokenEncoder` mixes token and pairwise features, including optional distogram/self-conditioning paths.
