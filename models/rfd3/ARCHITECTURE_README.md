@@ -115,14 +115,41 @@ flowchart LR
     ScaleOut --> Sampler[InferenceSampler\nEDM schedule, CFG]
     Sampler --> Output[Structures + metadata]
 
-    subgraph Optional CFG pass
-        CFGstrip[strip f by cfg_features]
-        CFGstrip --> TI2[TokenInitializer (ref)] --> LAT2[ref forward]
-    end
+      subgraph Optional CFG pass
+         CFGstrip[strip f by cfg_features]
+         CFGstrip --> TI2["TokenInitializer (ref)"] --> LAT2["ref forward"]
+      end
     Sampler -. blends .- TI2
 ```
 
 Key signals: `f` (conditioning features), `X_noisy_L` (coordinates at step), `t` (noise level). The recycle loop re-feeds updated positions and pairwise buckets to the encoder/decoder stack for iterative refinement.
+
+## Detailed execution order (single diffusion step)
+1. Build conditioning and geometry inputs:
+   - `f` carries token/atom mappings, masks, motif constraints, symmetry metadata, and optional conditioning features.
+   - `X_noisy_L` and `t` define the current diffusion state.
+2. Run `TokenInitializer`:
+   - Produces atom stream states (`Q_L`, `C_L`), atom-pair states (`P_LL`), and token stream states (`S_I`, `Z_II`).
+3. Run atom encoder path:
+   - `LocalAtomTransformer` updates atom-local context from neighborhood attention.
+   - `Downcast` pools atom information into token-aligned channels.
+4. Run token encoder/transformer path:
+   - `DiffusionTokenEncoder` fuses token states with pairwise/context and current coordinates.
+   - `LocalTokenTransformer` performs token-level attention updates.
+5. Decode and project outputs:
+   - `CompactStreamingDecoder` mixes token and atom streams back into refined atom states.
+   - Position head (`to_r_update`) predicts coordinate delta; sequence head predicts token logits.
+   - Distogram head produces `D_II_self` for recycle context.
+6. Recycle boundary:
+   - `scale_positions_out` returns updated coordinates `X_L`.
+   - (`X_L`, `D_II_self`) are fed into the next recycle iteration when `n_recycle > 0`.
+7. Sampler update:
+   - `InferenceSampler` applies schedule logic (EDM-style), optional CFG blending, and optional symmetry constraints to produce the next step state.
+
+## Recycle state summary
+- Position state: `X_L` (updated coordinates after output scaling).
+- Pairwise memory: `D_II_self` (distogram buckets used as iterative context).
+- Conditioning state: `f` remains fixed unless explicitly modified by CFG feature stripping in the reference pass.
 
 ## Quick references
 - Run inference: `rfd3 design out_dir=<dir> inputs=models/rfd3/docs/examples/demo.json dump_trajectories=True prevalidate_inputs=True`.
