@@ -156,8 +156,19 @@ flowchart TB
    Time --> ProcR[process_r and process_c\nplus downcast_c and process_a]
    ProcR --> RecycleLoop{{for i in n_recycle}}
 
-   RecycleLoop --> DTE
+   ProcR --> IDX[create_attention_indices]
 
+   RecycleLoop --> AENC
+
+   subgraph AENC[LocalAtomTransformer encoder]
+      LAPB["LocalAttentionPairBias\n(sparse or local pair-bias attention)"]
+      ABLK[n_blocks x StructureLocalAtomTransformerBlock]
+      LAPB --> ABLK
+   end
+
+   IDX --> LAPB
+
+   AENC --> DTE
    subgraph DTE[DiffusionTokenEncoder]
       DTE1[transition_1 x2 on S_I]
       DTE2[distogram processing\nuse_distogram plus use_self]
@@ -168,18 +179,29 @@ flowchart TB
 
    DTE --> LTT
    subgraph LTT[LocalTokenTransformer]
-      LTT0[create_attention_indices]
+      LTT0[attention indices input]
       LTT1[n_block x StructureLocalAtomTransformerBlock]
       LTT0 --> LTT1
    end
 
+   IDX --> LTT0
+
    LTT --> DEC
    subgraph DEC[CompactStreamingDecoder]
-      DEC1[per block: Upcast\ndefault method is cross_attention]
+      DEC1[per block: Upcast]
       DEC2[per block: AtomTransformer block]
-      DEC3[Downcast detached back to A_I\ndefault method is cross_attention]
+      DEC3[Downcast detached back to A_I]
       DEC1 --> DEC2 --> DEC3
    end
+
+   subgraph XATTN[Cross-attention bridges]
+      GCA[GatedCrossAttention]
+      CFG[default config\nupcast and downcast method = cross_attention]
+      CFG --> GCA
+   end
+
+   GCA -. used by .-> DEC1
+   GCA -. used by .-> DEC3
 
    DEC --> Heads
    subgraph Heads[Output heads]
@@ -203,44 +225,13 @@ This module-level diagram maps directly to code in `RFD3_diffusion_module.py`, `
 - `CompactStreamingDecoder` alternates upcast/atom-transformer updates and downcasts back to token space.
 - Output heads produce coordinates, sequence outputs, and recycle memory (`D_II_self`).
 
-## Attention mechanisms: where they are
-- **Cross-attention (implemented and enabled in default config)**
-   - Defined by `GatedCrossAttention` in [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L92).
-   - Used by `Upcast` when `method: cross_attention` in [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L478).
-   - Used by `Downcast` when `method: cross_attention` in [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L532).
-   - Default config enables both in [models/rfd3/configs/model/components/rfd3_net.yaml](models/rfd3/configs/model/components/rfd3_net.yaml#L67) and [models/rfd3/configs/model/components/rfd3_net.yaml](models/rfd3/configs/model/components/rfd3_net.yaml#L76).
-- **Sparse/local attention blocks (implemented and active through attention indices)**
-   - Local pair-bias attention module is `LocalAttentionPairBias` in [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L198).
-   - Sparse path executes in `SparseAttention` trace blocks in [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L340).
-   - Sparse neighbor indices are built by `create_attention_indices` in [models/rfd3/src/rfd3/model/layers/block_utils.py](models/rfd3/src/rfd3/model/layers/block_utils.py#L179).
-   - These indices are consumed in the diffusion module path in [models/rfd3/src/rfd3/model/RFD3_diffusion_module.py](models/rfd3/src/rfd3/model/RFD3_diffusion_module.py#L200).
-
-### Attention path diagram
-```mermaid
-flowchart LR
-   subgraph Runtime[Diffusion runtime]
-      direction LR
-      IDX[create_attention_indices] --> LAPB[LocalAttentionPairBias]
-      LAPB --> LAT[LocalAtomTransformer blocks]
-      IDX --> LTT[LocalTokenTransformer blocks]
-   end
-
-   subgraph CrossAttn[Cross-attention path]
-      direction LR
-      GCA[GatedCrossAttention] --> UP[Upcast method cross_attention]
-      GCA --> DOWN[Downcast method cross_attention]
-   end
-
-   UP --> DEC[CompactStreamingDecoder]
-   DOWN --> DEC
-
-   CFG[Default config rfd3_net.yaml] --> UP
-   CFG --> DOWN
-```
-
-Interpretation:
-- Sparse/local attention controls neighborhood-limited message passing in atom/token transformer blocks.
-- Cross-attention is used at atom-token exchange points (upcast/downcast), especially in decoder flow.
+Attention mapping in code:
+- `GatedCrossAttention`: [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L92)
+- `Upcast` cross-attention path: [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L478)
+- `Downcast` cross-attention path: [models/rfd3/src/rfd3/model/layers/blocks.py](models/rfd3/src/rfd3/model/layers/blocks.py#L532)
+- `LocalAttentionPairBias` and sparse attention path: [models/rfd3/src/rfd3/model/layers/attention.py](models/rfd3/src/rfd3/model/layers/attention.py#L198)
+- `create_attention_indices`: [models/rfd3/src/rfd3/model/layers/block_utils.py](models/rfd3/src/rfd3/model/layers/block_utils.py#L179)
+- Default cross-attention config for upcast/downcast: [models/rfd3/configs/model/components/rfd3_net.yaml](models/rfd3/configs/model/components/rfd3_net.yaml#L67) and [models/rfd3/configs/model/components/rfd3_net.yaml](models/rfd3/configs/model/components/rfd3_net.yaml#L76)
 
 ## Detailed execution order (single diffusion step)
 1. Build conditioning and geometry inputs:
