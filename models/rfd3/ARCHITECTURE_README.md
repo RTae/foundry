@@ -61,30 +61,32 @@ RFD3 is an AlphaFold3-inspired diffusion model for de novo biomolecular interact
 - Structures written as `*.cif.gz` (and optionally denoised/noisy trajectories) with conditioning annotations (`SAVED_CONDITIONING_ANNOTATIONS`).
 - Metadata JSON per design includes seeds, cfg parameters, metrics, and alignment info.
 
-## Mermaid overview
+## Overall architecture (high-level)
 ```mermaid
-flowchart TD
-    A[User JSON/YAML or PDB] --> B[Hydra compose<br/>configs/inference.yaml]
-    B --> C{RFD3InferenceEngine}
-    C --> D[Input parsing & transforms
-             build feature dict f
-             set fixed motifs/symmetry]
-    D --> E[TokenInitializer
-            Q_L,C_L,P_LL,S_I,Z_II]
-    E --> F[RFD3DiffusionModule
-            encoder -> token encoder ->
-            token transformer -> decoder]
-    F --> G[Recycle n times
-            distogram buckets,
-            position/sequence heads]
-    G --> H[InferenceSampler
-            EDM schedule,
-            CFG optional,
-            symmetry apply]
-    H --> I[Outputs
-            CIF/JSON + trajectories
-            metrics/logs]
+flowchart LR
+    IN[Residue and atomic features] --> FI[Feature Initializer\nTokenInitializer]
+
+   subgraph DNS[Denoising Step]
+      direction LR
+      subgraph RSTEP[Recycle Step]
+         direction LR
+         ENC[Encoder\nLocalAtomTransformer] --> TR[Transformer\nLocalTokenTransformer]
+         TR --> DEC[Decoder\nCompactStreamingDecoder]
+      end
+
+      DEC --> HDS[Heads\nposition + sequence + distogram]
+      HDS -. Recycling .-> ENC
+      HDS --> XNEXT[X_t -> X_t-1]
+   end
+
+   FI --> ENC
+   XNEXT --> SAMP[Sampler Step\nEDM + CFG + symmetry]
+    SAMP --> O[Output\nstructures + metadata]
+
+    SAMP -. Next timestep .-> ENC
 ```
+
+This top-level diagram is intentionally block-oriented. The next sections break down each module in detail.
 
 ## Model architecture
 ```mermaid
