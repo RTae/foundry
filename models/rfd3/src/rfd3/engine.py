@@ -35,7 +35,7 @@ from rfd3.utils.io import (
     extract_example_id_from_path,
     find_files_with_extension,
 )
-from rfd3.utils.tracing import maybe_sync_cuda, trace_range
+from rfd3.utils.tracing import dump_memory_log, maybe_sync_cuda, memory_tracking_enabled, trace_range
 
 logging.basicConfig(level=logging.INFO)
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
@@ -231,6 +231,14 @@ class RFD3InferenceEngine(BaseInferenceEngine):
             with trace_range("rfd3.engine.run_multi"):
                 outputs = self._run_multi(design_specifications)
             maybe_sync_cuda()
+
+            if memory_tracking_enabled():
+                log_path = Path(self.out_dir or ".") / "rfd3_memory_log.json"
+                log = dump_memory_log(log_path)
+                ranked_logger.info(
+                    f"Memory log ({len(log)} entries) written to {log_path}"
+                )
+
             return outputs
 
     def _set_out_dir(self, out_dir: str | PathLike | None):
