@@ -26,7 +26,10 @@ from rfd3.model.layers.layer_utils import (
     linearNoBias,
 )
 from rfd3.model.layers.pairformer_layers import PairformerBlock
-from rfd3.utils.matrix_capture import capture_pairwise_initializer_structure
+from rfd3.utils.matrix_capture import (
+    capture_initializer_outputs,
+    capture_pairwise_initializer_structure,
+)
 from rfd3.utils.tracing import trace_range
 
 from foundry.common import exists
@@ -308,13 +311,15 @@ class TokenInitializer(nn.Module):
                             C_L.unsqueeze(0), None, P_LL, indices=None, f=f, X_L=None
                         ).squeeze(0)
 
-                return {
+                result = {
                     "Q_L_init": Q_L_init,
                     "C_L": C_L,
                     "P_LL": P_LL,
                     "S_I": S_init_I,
                     "Z_II": Z_init_II,
                 }
+                capture_initializer_outputs(result)
+                return result
 
         with trace_range("RFD3/TokenInitializer"):
             tokens = init_tokens()
