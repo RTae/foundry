@@ -51,7 +51,168 @@ flowchart LR
 - The recycling loop enables iterative refinement within each denoising step.
 - The denoising loop iterates over diffusion timesteps, progressively denoising the structure.
 
-## Block-by-Block Layer Breakdown
+---
+
+## Core Building Block — `StructureLocalAtomTransformerBlock`
+
+Every transformer module in RFD3 — Atom Encoder, Token Transformer, and Atom Decoder — is built from the same fundamental unit: `StructureLocalAtomTransformerBlock`. Understanding this block is key to understanding the entire architecture.
+
+**Used in:**
+- **Atom Encoder** (`LocalAtomTransformer`) — 3 blocks
+- **Token Transformer** (`LocalTokenTransformer`) — 18 blocks
+- **Atom Decoder** (`CompactStreamingDecoder`) — 3 blocks (wrapped with Upcast/Downcast)
+
+### Simplified
+
+```mermaid
+flowchart LR
+    IN["Input\n(features)"] --> ATTN_SUB["AdaLN → Sparse Local\nAttention + Pair Bias\n→ Gated Output"]
+    COND["Conditioning"] -.-> ATTN_SUB
+    PAIR["Pair Features"] -.-> ATTN_SUB
+    ATTN_SUB --> RES1["⊕"]
+    IN --> RES1
+    RES1 --> MLP_SUB["AdaLN → SwiGLU MLP\n→ Gated Output"]
+    COND -.-> MLP_SUB
+    MLP_SUB --> RES2["⊕"]
+    RES1 --> RES2
+    RES2 --> OUT["Output\n(updated)"]
+
+    style IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style ATTN_SUB fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style MLP_SUB fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style RES1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style RES2 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style COND fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style PAIR fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
+```
+
+Two residual sub-layers: **(1) Attention** — sparse local attention conditioned on pair features, **(2) MLP** — SwiGLU feed-forward conditioned on single representations.
+
+### Detailed
+
+```mermaid
+flowchart TD
+    INPUT["Input (Q_L)"] --> ADALN1["AdaLN\n(conditioned on C_L)"]
+    COND1["C_L (conditioning)"] -.-> ADALN1
+    ADALN1 --> QKV["Q / K / V Projections\n(LinearNoBias × 3)"]
+    QKV --> QKNORM["RMSNorm on Q and K"]
+    PAIR["P_LL (pair features)"] --> BIAS["Pair Bias Projection\n(LinearNoBias → per-head)"]
+    QKNORM --> ATTN["Sparse Local Attention\n+ Pair Bias"]
+    BIAS --> ATTN
+    ATTN --> GATE1["Gated Output\nσ(Linear(C_L)) × to_o(attn)"]
+    COND1b["C_L"] -.-> GATE1
+    GATE1 --> DROP["Dropout"]
+    DROP --> RES1["⊕ Residual"]
+    INPUT --> RES1
+
+    RES1 --> ADALN2["AdaLN\n(conditioned on C_L)"]
+    COND2["C_L"] -.-> ADALN2
+    ADALN2 --> LIN1["Linear₁: c → n·c"]
+    ADALN2 --> LIN2["Linear₂: c → n·c"]
+    LIN1 --> SILU["SiLU"]
+    SILU --> MULT["× Element-wise\n(SwiGLU)"]
+    LIN2 --> MULT
+    MULT --> LIN3["Linear₃: n·c → c"]
+    LIN3 --> GATE2["Gated Output\nσ(Linear(C_L)) × output"]
+    COND2b["C_L"] -.-> GATE2
+    GATE2 --> RES2["⊕ Residual"]
+    RES1 --> RES2
+    RES2 --> OUTPUT["Output (Q_L updated)"]
+
+    style INPUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style OUTPUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style ADALN1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style ADALN2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style QKV fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style QKNORM fill:#e3f2fd,stroke:#1976D2,stroke-width:1px,color:#0D47A1
+    style ATTN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style BIAS fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style PAIR fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style GATE1 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style GATE2 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style DROP fill:#f5f5f5,stroke:#9E9E9E,stroke-width:1px,color:#616161
+    style LIN1 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style LIN2 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style SILU fill:#f3e5f5,stroke:#9C27B0,stroke-width:1px,color:#6A1B9A
+    style MULT fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style LIN3 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style RES1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style RES2 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style COND1 fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style COND1b fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style COND2 fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style COND2b fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+```
+
+**Attention sub-layer** (top half):
+1. **AdaLN** — Adaptive Layer Norm conditioned on single representations (C_L). Produces scale/shift.
+2. **Q/K/V projections** — Three `LinearNoBias` layers. Q and K are RMSNorm-normalized.
+3. **Pair bias** — `LinearNoBias` projects P_LL to per-head bias, added to attention logits.
+4. **Sparse local attention** — Scaled dot-product over nearest-neighbor indices (3D spatial).
+5. **Gated output** — `σ(Linear(C_L)) × to_o(attn_out)` (adaLN-Zero pattern).
+
+**Transition sub-layer** (bottom half):
+1. **AdaLN** — Conditions on C_L.
+2. **SwiGLU** — Two parallel linear projections; one through SiLU, then element-wise multiply, then project back.
+3. **Gated output** — Same adaLN-Zero gating as above.
+
+Both sub-layers have **residual connections**.
+
+### Encoder vs Decoder Wrapping
+
+The same core block is wrapped differently depending on context. The encoder chains blocks directly; the decoder adds **Upcast** (token → atom) before each block and a final **Downcast** (atom → token):
+
+```mermaid
+flowchart LR
+    subgraph Encoder["Encoder (LocalAtomTransformer)"]
+        direction LR
+        E_IN["Q_L"] --> EB1["Block 1\n(core)"] --> EB2["Block 2\n(core)"] --> EB3["Block 3\n(core)"] --> E_OUT["Q_L"]
+    end
+
+    subgraph Decoder["Decoder (CompactStreamingDecoder)"]
+        direction LR
+        D_AI["A_I\n(token)"] -.-> U1
+        D_QL["Q_L\n(atom)"] --> U1["Upcast"] --> DB1["Block 1\n(core)"] --> U2["Upcast"] --> DB2["Block 2\n(core)"] --> U3["Upcast"] --> DB3["Block 3\n(core)"] --> DC["Downcast"]
+        D_AI -.-> U2
+        D_AI -.-> U3
+        D_AI -.-> DC
+        DC --> D_AI_OUT["A_I"]
+        DB3 --> D_QL_OUT["Q_L"]
+    end
+
+    style E_IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style E_OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style EB1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style EB2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style EB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style D_AI fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style D_QL fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style D_AI_OUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style D_QL_OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style U1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style U2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style U3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style DC fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style DB1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style DB2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style DB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+```
+
+| | Encoder | Decoder |
+|---|---------|---------|
+| **Class** | `LocalAtomTransformer` | `CompactStreamingDecoder` |
+| **Wrapping** | None — blocks run directly | Upcast before each block, Downcast after all blocks |
+| **Upcast** | — | Injects token `A_I` into atom `Q_L` (broadcast or cross-attention) |
+| **Downcast** | — | Pools atom `Q_L` back to token `A_I` (mean-pool or cross-attention) |
+| **Core block** | `StructureLocalAtomTransformerBlock` (identical) | `StructureLocalAtomTransformerBlock` (identical) |
+| **Dropout** | 0.0 | 0.10 |
+
+The core block (blue) is **identical** in both — only the outer wrapping differs. The decoder needs Upcast/Downcast to bridge token ↔ atom scales because it sits after the Token Transformer and must fuse token-level predictions back into atom-level coordinates.
+
+---
+
+## Pipeline Breakdown
 
 Each component below is presented in **pipeline execution order** — the order data flows through during each recycling iteration of a denoising step:
 
@@ -199,7 +360,7 @@ flowchart TD
 
 ### Step 2 — Atom Encoder (`LocalAtomTransformer`, 3 blocks)
 
-Each of the 3 blocks is a `StructureLocalAtomTransformerBlock`. The attention and MLP sub-layers are broken down below.
+3 sequential `StructureLocalAtomTransformerBlock`s (see [Core Building Block](#core-building-block--structurelocalatomtransformerblock) above). Operates on atom-level features with C_L conditioning and P_LL pair bias.
 
 #### Simplified (Presentation)
 
@@ -424,7 +585,7 @@ flowchart TD
 
 ### Step 4 — Token Transformer (`LocalTokenTransformer`, 18 blocks)
 
-Uses the same `StructureLocalAtomTransformerBlock` as the Atom Transformer, but operates on token-level features (A_I) with pair bias from Z_II. Sparse attention indices are built from 3D coordinates (128 keys, 2-4 neighbors).
+18 sequential `StructureLocalAtomTransformerBlock`s (see [Core Building Block](#core-building-block--structurelocalatomtransformerblock) above). Same block architecture as the Atom Encoder but at token level — operates on A_I with S_I conditioning and Z_II pair bias. Sparse attention indices are built from 3D coordinates (128 keys, 2-4 neighbors). This is the heaviest computation in the model.
 
 #### Simplified (Presentation)
 
@@ -443,8 +604,6 @@ flowchart LR
     style SI fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
     style ZII fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
 ```
-
-18 blocks of **Sparse Local Attention (with pair bias) + SwiGLU MLP** — same block architecture as the Atom Encoder but at token level. This is the heaviest computation in the model.
 
 #### Detailed
 
@@ -528,7 +687,7 @@ flowchart TD
 
 ### Step 5 — Atom Decoder (`CompactStreamingDecoder`, 3 blocks)
 
-The decoder wraps 3 `StructureLocalAtomTransformerBlock`s with cross-scale Upcast/Downcast layers. Each block refines atom features while incorporating token-level context.
+3 `StructureLocalAtomTransformerBlock`s wrapped with Upcast/Downcast (see [Encoder vs Decoder Wrapping](#encoder-vs-decoder-wrapping) above). Each block refines atom features while incorporating token-level context via cross-attention bridging.
 
 #### Simplified (Presentation)
 
@@ -713,142 +872,7 @@ Return (A_I, Q_L)
 | Token Transformer       | LocalTokenTransformer    | Encoder | 18     | AdaLN, Sparse Local Attention + Pair Bias (128 keys), SwiGLU MLP, Residual |
 | Atom Decoder            | CompactStreamingDecoder  | Decoder | 3      | Cross-Attn Upcast × 3, Atom Transformer Block × 3, Cross-Attn Downcast × 1 |
 
-All Atom Transformer and Token Transformer blocks — including the 3 blocks inside the decoder — share the same internal architecture (`StructureLocalAtomTransformerBlock`): **Local Attention with Pair Bias + Conditioned Transition (SwiGLU)**. The encoder (`LocalAtomTransformer`) runs these blocks directly on atom features, while the decoder (`CompactStreamingDecoder`) wraps them with cross-attention Upcast/Downcast layers to bridge token and atom scales. See the [Note: Encoder vs Decoder](#note-encoder-vs-decoder--same-block-different-architecture) below for details.
-
-> **Pipeline:** Decoder outputs updated `A_I` and `Q_L`. If more recycle iterations remain, these feed back to Step 2. Otherwise, proceed to prediction heads and denoising output.
-
----
-
-### Note: Encoder vs Decoder — Same Block, Different Architecture
-
-The paper describes the encoder and decoder as using the **same Atom Transformer architecture**. In the code, however, they are implemented as two distinct classes:
-
-| Aspect | Encoder | Decoder |
-|--------|---------|--------|
-| **Class** | `LocalAtomTransformer` | `CompactStreamingDecoder` |
-| **Core block** | `StructureLocalAtomTransformerBlock` × 3 | `StructureLocalAtomTransformerBlock` × 3 |
-| **Upcast/Downcast** | None | Yes — cross-attention Upcast before each block, Downcast after all blocks |
-| **Input** | Atom-level only (`Q_L`, `C_L`, `P_LL`) | Token-level (`A_I`, `S_I`, `Z_II`) + Atom-level (`Q_L`, `C_L`, `P_LL`) |
-| **Output** | `Q_L` (atom features) | `(A_I, Q_L, offsets)` — both token and atom outputs |
-| **Dropout** | 0.0 | 0.10 |
-| **Scale bridging** | None — operates purely at atom level | Token ↔ Atom bridging via Upcast/Downcast |
-
-**Why are they different?**
-
-The paper says "same architecture" because both encoder and decoder use `StructureLocalAtomTransformerBlock` as their core repeating unit — identical local attention with pair bias + SwiGLU transition. However, the **decoder** sits after the Token Transformer, so it must fuse token-level predictions back into atom-level coordinates. This requires:
-
-- **Upcast** (before each block): Projects token-level features (`A_I`) down to atom-level via cross-attention, so the atom transformer block can incorporate token-level information.
-- **Downcast** (after all blocks): Pools atom-level features back up to token-level via cross-attention, producing updated token representations for the recycling loop.
-
-The **encoder**, by contrast, runs before any token-level processing and only needs to operate on atom-level features directly — no scale bridging needed.
-
----
-
-### Generalized AtomTransformer Layer Architecture
-
-The diagram below shows the **shared core block** (`StructureLocalAtomTransformerBlock`) and how it generalizes to both encoder and decoder usage.
-
-#### Core Block — `StructureLocalAtomTransformerBlock`
-
-Every Atom Encoder block, Token Transformer block, and Decoder atom block uses this identical internal architecture:
-
-```mermaid
-flowchart TD
-    INPUT["Q_L (features)"] --> ADALN1["AdaLN\n(conditioned on C_L)"]
-    COND1["C_L (conditioning)"] -.-> ADALN1
-    ADALN1 --> QKV["Q / K / V Projections"]
-    PAIR["P_LL (pair features)"] --> BIAS["Pair Bias\nProjection"]
-    QKV --> ATTN["Sparse Local Attention\n+ Pair Bias"]
-    BIAS --> ATTN
-    ATTN --> GATE1["Gated Output\nσ(Linear(C_L)) × Linear(attn)"]
-    COND1b["C_L"] -.-> GATE1
-    GATE1 --> DROP["Dropout"]
-    DROP --> RES1["⊕ Residual"]
-    INPUT --> RES1
-
-    RES1 --> ADALN2["AdaLN\n(conditioned on C_L)"]
-    COND2["C_L"] -.-> ADALN2
-    ADALN2 --> SWIGLU["SwiGLU\nSiLU(Linear₁) × Linear₂ → Linear₃"]
-    SWIGLU --> GATE2["Gated Output\nσ(Linear(C_L)) × output"]
-    COND2b["C_L"] -.-> GATE2
-    GATE2 --> RES2["⊕ Residual"]
-    RES1 --> RES2
-    RES2 --> OUTPUT["Q_L (updated)"]
-
-    style INPUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
-    style OUTPUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
-    style ADALN1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style ADALN2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style QKV fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style ATTN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style BIAS fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
-    style PAIR fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
-    style GATE1 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
-    style GATE2 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
-    style DROP fill:#f5f5f5,stroke:#9E9E9E,stroke-width:1px,color:#616161
-    style SWIGLU fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
-    style RES1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
-    style RES2 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
-    style COND1 fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
-    style COND1b fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
-    style COND2 fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
-    style COND2b fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
-```
-
-The block has two residual sub-layers:
-1. **Attention sub-layer**: AdaLN → Q/K/V projection → sparse local attention with pair bias → gated output → residual add
-2. **Transition sub-layer**: AdaLN → SwiGLU MLP (SiLU gating) → gated output → residual add
-
-Both sub-layers use **AdaLN** (Adaptive Layer Norm) conditioned on `C_L` and **gated output** modulated by `C_L`.
-
-#### Encoder vs Decoder Wrapping
-
-The same core block is wrapped differently depending on the context:
-
-```mermaid
-flowchart LR
-    subgraph Encoder["Encoder (LocalAtomTransformer)"]
-        direction LR
-        E_IN["Q_L"] --> EB1["Block 1\n(core)"] --> EB2["Block 2\n(core)"] --> EB3["Block 3\n(core)"] --> E_OUT["Q_L"]
-    end
-
-    subgraph Decoder["Decoder (CompactStreamingDecoder)"]
-        direction LR
-        D_AI["A_I\n(token)"] -.-> U1
-        D_QL["Q_L\n(atom)"] --> U1["Upcast"] --> DB1["Block 1\n(core)"] --> U2["Upcast"] --> DB2["Block 2\n(core)"] --> U3["Upcast"] --> DB3["Block 3\n(core)"] --> DC["Downcast"]
-        D_AI -.-> U2
-        D_AI -.-> U3
-        D_AI -.-> DC
-        DC --> D_AI_OUT["A_I"]
-        DB3 --> D_QL_OUT["Q_L"]
-    end
-
-    style E_IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
-    style E_OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
-    style EB1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style EB2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style EB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style D_AI fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style D_QL fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
-    style D_AI_OUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style D_QL_OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
-    style U1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style U2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style U3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style DC fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
-    style DB1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style DB2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style DB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-```
-
-| | Encoder | Decoder |
-|---|---------|---------|
-| **Wrapping** | None — blocks run directly | Upcast before each block, Downcast after all blocks |
-| **Upcast** | — | Injects token-level `A_I` into atom-level `Q_L` via cross-attention or broadcast |
-| **Downcast** | — | Pools atom-level `Q_L` back to token-level `A_I` via mean-pooling or cross-attention |
-| **Core block** | `StructureLocalAtomTransformerBlock` (identical) | `StructureLocalAtomTransformerBlock` (identical) |
-
-The core block (blue) is **identical** in both cases — only the outer wrapping differs.
+All transformer blocks share the same `StructureLocalAtomTransformerBlock` core — see [Core Building Block](#core-building-block--structurelocalatomtransformerblock) for full details and encoder vs decoder comparison.
 
 ---
 
