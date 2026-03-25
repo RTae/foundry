@@ -3,7 +3,6 @@
 
 This document provides a detailed, code- and paper-accurate overview of the RFD3 model architecture, focusing on the interplay between the denoising (diffusion) and recycling (refinement) loops. The diagrams and descriptions below are formatted for clarity and flow, and use terminology consistent with the published paper.
 
----
 
 ## Model Flow Diagram
 
@@ -52,12 +51,7 @@ flowchart LR
 - The recycling loop enables iterative refinement within each denoising step.
 - The denoising loop iterates over diffusion timesteps, progressively denoising the structure.
 
----
-
-
 ## Block-by-Block Layer Breakdown
-
----
 
 ### Feature Initializer (TokenInitializer)
 
@@ -94,7 +88,6 @@ flowchart TD
 - **PairformerBlock x2:** Two Pairformer blocks that mix single (S_I) and pair (Z_II) representations via attention and transition layers.
 - **Atom Pair MLP:** Builds atom-level pairwise features (P_LL) using a 3-layer ReLU + Linear MLP.
 
----
 
 ### Atom Transformer (LocalAtomTransformer)
 
@@ -126,7 +119,6 @@ flowchart TD
 - **Conditioned Transition / SwiGLU MLP:** Feed-forward block using AdaLN + SwiGLU gating, or RMSNorm + two linear layers with SiLU activation.
 - **Residual Connection:** Adds the MLP output back to the input.
 
----
 
 ### Token Transformer (LocalTokenTransformer)
 
@@ -158,7 +150,6 @@ flowchart TD
 - **Conditioned Transition / SwiGLU MLP:** Feed-forward block using AdaLN + SwiGLU gating, or RMSNorm + two linear layers with SiLU activation.
 - **Residual Connection:** Adds the MLP output back to the input.
 
----
 
 ### DiffusionTokenEncoder (Self-Conditioning, between Atom Encoder and Token Transformer)
 
@@ -191,7 +182,6 @@ flowchart TD
 - **Pair Transition x2:** Two transition layers to refine the pair representation (Z_II).
 - **PairformerBlock x2:** Two Pairformer blocks that mix single and pair representations via attention and transition layers.
 
----
 
 ### Summary Table
 
@@ -203,8 +193,6 @@ flowchart TD
 | Token Transformer       | LocalTokenTransformer    | 18     | AdaLN, Sparse Local Attention + Pair Bias (128 keys), SwiGLU MLP, Residual |
 
 All Atom Transformer and Token Transformer blocks share the same internal architecture (`StructureLocalAtomTransformerBlock`): **Local Attention with Pair Bias + Conditioned Transition (SwiGLU)**. The difference is in the number of blocks, the input level (atom vs. token), and the attention indices used.
-
----
 
 
 ## Step-by-Step Model Flow
