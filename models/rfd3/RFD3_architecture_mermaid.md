@@ -44,41 +44,123 @@ flowchart LR
 
 ## Block-by-Block Layer Breakdown
 
-#### Feature Initializer (2 blocks, Encoder)
-- **Each block typically includes:**
-    - Linear projection layers to embed residue and atomic features into model space
-    - Layer normalization
-    - Nonlinear activation (e.g., ReLU or GELU)
-    - Optional dropout for regularization
-    - May include initial pairwise or positional encodings
+---
 
-#### Atom Transformer (3 blocks, Encoder/Decoder)
-- **Each block typically includes:**
-    - Multi-head self-attention over atomic features (local or sparse attention)
-    - Feed-forward network (MLP) with nonlinear activation
-    - Layer normalization (pre- or post-attention/MLP)
-    - Residual connections around attention and MLP sublayers
-    - Optional dropout for regularization
-    - In the decoder role (last Atom Transformer), may include additional output heads or coordinate refinement layers
+### Feature Initializer (TokenInitializer)
 
-#### Token Transformer (18 blocks, Encoder)
-- **Each block typically includes:**
-    - Multi-head self-attention over token (residue) features (can be global or local)
-    - Feed-forward network (MLP) with nonlinear activation
-    - Layer normalization (pre- or post-attention/MLP)
-    - Residual connections around attention and MLP sublayers
-    - Optional dropout for regularization
-    - May include cross-attention to atomic features or pairwise representations
+The Feature Initializer prepares the model's internal representations from raw input features. It embeds residue and atomic features, builds pairwise representations, and runs a small Pairformer stack for initial mixing.
 
-**Summary Table:**
+```mermaid
+flowchart TD
+    subgraph FeatureInitializer["Feature Initializer (TokenInitializer)"]
+        direction TB
+        A1[Atom 1D Embedder x2<br><i>Embed atomic features</i>]
+        A2[Token 1D Embedder<br><i>Embed residue features</i>]
+        A3[Downcast: Atom to Token<br><i>Pool atom reps to token level</i>]
+        A4[Pairwise Init<br><i>Relative position encoding<br>Bond features<br>Distance embedding</i>]
+        A5[PairformerBlock x2<br><i>S_I and Z_II mixing<br>Attention + Transition</i>]
+        A6[Atom Pair MLP<br><i>ReLU, Linear x3<br>Build P_LL</i>]
+        A1 --> A3
+        A2 --> A3
+        A3 --> A4 --> A5 --> A6
+    end
+```
 
-| Block                | Layers/Operations                                                                 |
-|----------------------|---------------------------------------------------------------------------------|
-| Feature Initializer  | Linear projection, LayerNorm, Activation, Dropout, Positional/Pairwise encoding  |
-| Atom Transformer     | Multi-head self-attention, MLP, LayerNorm, Residual, Dropout                     |
-| Token Transformer    | Multi-head self-attention, MLP, LayerNorm, Residual, Dropout, (optional cross-attention) |
+- **Atom 1D Embedders:** Two embedding layers that project raw atomic features into model space.
+- **Token 1D Embedder:** Embeds residue-level features.
+- **Downcast:** Pools atom representations to the token (residue) level.
+- **Pairwise Init:** Builds initial pairwise representations using relative position encoding, bond features, and distance embeddings.
+- **PairformerBlock x2:** Two Pairformer blocks that mix single (S_I) and pair (Z_II) representations via attention and transition layers.
+- **Atom Pair MLP:** Builds atom-level pairwise features (P_LL) using a 3-layer ReLU + Linear MLP.
 
-These blocks are stacked as shown in the diagram, with outputs from one block feeding into the next. The recycling loop enables repeated refinement, and the decoder Atom Transformer produces the final output for each recycle iteration.
+---
+
+### Atom Transformer (LocalAtomTransformer)
+
+The Atom Transformer processes atom-level features using sparse local attention and gated feed-forward layers. Each of the 3 blocks shares the same architecture.
+
+```mermaid
+flowchart TD
+    subgraph AtomTransformerBlock["Atom Transformer Block (x3)"]
+        direction TB
+        B1[AdaLN / RMSNorm<br><i>Conditional or standard normalization</i>]
+        B2[Local Attention with Pair Bias<br><i>Sparse multi-head self-attention<br>Q/K normalization<br>Pair bias from P_LL<br>Gating via Sigmoid</i>]
+        B3[Residual Connection]
+        B4[Conditioned Transition / SwiGLU MLP<br><i>AdaLN + SwiGLU gated MLP<br>or RMSNorm + Linear x2 + SiLU</i>]
+        B5[Residual Connection]
+        B1 --> B2 --> B3 --> B4 --> B5
+    end
+```
+
+- **AdaLN / RMSNorm:** Normalizes input, optionally conditioned on single representations (AdaLN-Zero style).
+- **Local Attention with Pair Bias:** Sparse multi-head self-attention over atom features, using Q/K normalization and pair bias from atom-pair features (P_LL). Output is gated via sigmoid.
+- **Residual Connection:** Adds the attention output back to the input.
+- **Conditioned Transition / SwiGLU MLP:** Feed-forward block using AdaLN + SwiGLU gating, or RMSNorm + two linear layers with SiLU activation.
+- **Residual Connection:** Adds the MLP output back to the input.
+
+---
+
+### Token Transformer (LocalTokenTransformer)
+
+The Token Transformer processes token-level (residue-level) features. It uses the same block architecture as the Atom Transformer, but operates at the token level with 18 blocks and sparse attention indices computed from 3D coordinates.
+
+```mermaid
+flowchart TD
+    subgraph TokenTransformerBlock["Token Transformer Block (x18)"]
+        direction TB
+        C1[AdaLN / RMSNorm<br><i>Conditional or standard normalization</i>]
+        C2[Local Attention with Pair Bias<br><i>Sparse multi-head self-attention<br>128 keys, 2-4 neighbors<br>Pair bias from Z_II<br>Gating via Sigmoid</i>]
+        C3[Residual Connection]
+        C4[Conditioned Transition / SwiGLU MLP<br><i>AdaLN + SwiGLU gated MLP<br>or RMSNorm + Linear x2 + SiLU</i>]
+        C5[Residual Connection]
+        C1 --> C2 --> C3 --> C4 --> C5
+    end
+```
+
+- **AdaLN / RMSNorm:** Normalizes input, optionally conditioned on single representations.
+- **Local Attention with Pair Bias:** Sparse multi-head self-attention over token features, using 128 attention keys and 2-4 sequence neighbors. Pair bias is derived from Z_II. Output is gated via sigmoid.
+- **Residual Connection:** Adds the attention output back to the input.
+- **Conditioned Transition / SwiGLU MLP:** Feed-forward block using AdaLN + SwiGLU gating, or RMSNorm + two linear layers with SiLU activation.
+- **Residual Connection:** Adds the MLP output back to the input.
+
+---
+
+### DiffusionTokenEncoder (Self-Conditioning, between Atom Encoder and Token Transformer)
+
+The DiffusionTokenEncoder sits between the Atom Encoder and Token Transformer. It conditions the token and pair representations using noise-level and distogram information.
+
+```mermaid
+flowchart TD
+    subgraph DiffusionTokenEncoder["DiffusionTokenEncoder"]
+        direction TB
+        D1[Transition x2<br><i>Refine S_I single reps</i>]
+        D2[Distogram Embedding<br><i>Sinusoidal or 65-bin bucketed<br>from noisy coords</i>]
+        D3[Concatenate Z_II + Distogram<br><i>RMSNorm, Linear projection</i>]
+        D4[Pair Transition x2<br><i>Refine Z_II pair reps</i>]
+        D5[PairformerBlock x2<br><i>S_I and Z_II mixing<br>Attention + Transition</i>]
+        D1 --> D5
+        D2 --> D3 --> D4 --> D5
+    end
+```
+
+- **Transition x2:** Two transition layers (RMSNorm + Linear + SiLU) to refine the single representation (S_I).
+- **Distogram Embedding:** Embeds pairwise distances from noisy coordinates, using sinusoidal embedding or 65-bin Gaussian PDF bucketing.
+- **Concatenate + Project:** Concatenates Z_II with the distogram embedding, then applies RMSNorm and a linear projection.
+- **Pair Transition x2:** Two transition layers to refine the pair representation (Z_II).
+- **PairformerBlock x2:** Two Pairformer blocks that mix single and pair representations via attention and transition layers.
+
+---
+
+### Summary Table
+
+| Component               | Class                    | Blocks | Key Layers                                                                 |
+|-------------------------|--------------------------|--------|---------------------------------------------------------------------------|
+| Feature Initializer     | TokenInitializer         | —      | 1D Embedders, Downcast, RelPos, 2 PairformerBlocks, Atom Pair MLP        |
+| Atom Transformer        | LocalAtomTransformer     | 3      | AdaLN, Sparse Local Attention + Pair Bias, SwiGLU MLP, Residual          |
+| DiffusionTokenEncoder   | DiffusionTokenEncoder    | —      | 2 Transitions, Distogram Embed, 2 Pair Transitions, 2 PairformerBlocks   |
+| Token Transformer       | LocalTokenTransformer    | 18     | AdaLN, Sparse Local Attention + Pair Bias (128 keys), SwiGLU MLP, Residual |
+
+All Atom Transformer and Token Transformer blocks share the same internal architecture (`StructureLocalAtomTransformerBlock`): **Local Attention with Pair Bias + Conditioned Transition (SwiGLU)**. The difference is in the number of blocks, the input level (atom vs. token), and the attention indices used.
 
 ---
 
