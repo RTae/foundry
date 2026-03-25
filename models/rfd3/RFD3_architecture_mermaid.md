@@ -63,6 +63,26 @@ Each component below is presented in **pipeline execution order** — the order 
 
 The Feature Initializer prepares the model's internal representations from raw input features. It embeds residue and atomic features, builds pairwise representations, and runs a small Pairformer stack for initial mixing.
 
+#### Simplified (Presentation)
+
+```mermaid
+flowchart LR
+    A["Atom & Token\nFeatures"] --> B["Embed\n(Linear x2)"] --> C["Downcast\n(Atom→Token)"] --> D["Pairwise Init\n(Outer Sum + RelPos)"] --> E["PairformerBlock\n× 2"] --> F["Atom Pair MLP"]
+    F --> OUT1["S_I, Z_II\n(token-level)"]
+    F --> OUT2["Q_L, C_L, P_LL\n(atom-level)"]
+
+    style A fill:#e8f4fd,stroke:#2196F3,stroke-width:2px,color:#1565C0
+    style B fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style C fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style D fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style E fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style F fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style OUT1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style OUT2 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+```
+
+#### Detailed
+
 ```mermaid
 flowchart TD
     subgraph Embedders["1. Feature Embedding"]
@@ -181,6 +201,27 @@ flowchart TD
 
 Each of the 3 blocks is a `StructureLocalAtomTransformerBlock`. The attention and MLP sub-layers are broken down below.
 
+#### Simplified (Presentation)
+
+```mermaid
+flowchart LR
+    IN["Q_L\n(atom features)"] --> B1["Block 1\nAttn + SwiGLU"] --> B2["Block 2\nAttn + SwiGLU"] --> B3["Block 3\nAttn + SwiGLU"] --> OUT["Q_L\n(refined)"]
+    CL["C_L conditioning"] -.-> B1 & B2 & B3
+    PLL["P_LL pair bias"] -.-> B1 & B2 & B3
+
+    style IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style B1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style B2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style B3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style CL fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style PLL fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
+```
+
+Each block: **AdaLN → Sparse Local Attention (with pair bias) → Residual → AdaLN → SwiGLU MLP → Residual**
+
+#### Detailed
+
 ```mermaid
 flowchart TD
     INPUT[Q_L input] --> BLOCK1
@@ -270,6 +311,29 @@ flowchart TD
 ### Step 3 — DiffusionTokenEncoder (Self-Conditioning)
 
 Sits between the Atom Encoder and Token Transformer. Conditions token and pair representations using noise-level and distogram information.
+
+#### Simplified (Presentation)
+
+```mermaid
+flowchart LR
+    SI_IN["S_I"] --> T1["Transition × 2"] --> MIX
+    ZII_IN["Z_II"] --> DIST["+ Distogram\nEmbedding"] --> T2["Pair Transition × 2"] --> MIX["PairformerBlock\n× 2"]
+    MIX --> SI_OUT["S_I\n(conditioned)"]
+    MIX --> ZII_OUT["Z_II\n(conditioned)"]
+
+    style SI_IN fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style T1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style ZII_IN fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style DIST fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style T2 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style MIX fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style SI_OUT fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style ZII_OUT fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+```
+
+Conditions representations on the current noise level and inter-residue distances before the main Token Transformer.
+
+#### Detailed
 
 ```mermaid
 flowchart TD
@@ -362,6 +426,28 @@ flowchart TD
 
 Uses the same `StructureLocalAtomTransformerBlock` as the Atom Transformer, but operates on token-level features (A_I) with pair bias from Z_II. Sparse attention indices are built from 3D coordinates (128 keys, 2-4 neighbors).
 
+#### Simplified (Presentation)
+
+```mermaid
+flowchart LR
+    IN["A_I\n(token features)"] --> B1["Block 1"] --> B2["Block 2"] --> dots["..."] --> B18["Block 18"] --> OUT["A_I\n(refined)"]
+    SI["S_I conditioning"] -.-> B1 & B2 & B18
+    ZII["Z_II pair bias"] -.-> B1 & B2 & B18
+
+    style IN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style B1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style B2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style dots fill:#fafafa,stroke:#9E9E9E,stroke-width:1px,stroke-dasharray:3 3,color:#616161
+    style B18 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style OUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style SI fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style ZII fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
+```
+
+18 blocks of **Sparse Local Attention (with pair bias) + SwiGLU MLP** — same block architecture as the Atom Encoder but at token level. This is the heaviest computation in the model.
+
+#### Detailed
+
 ```mermaid
 flowchart TD
     TINPUT[A_I input] --> IDX[Build sparse attention indices<br><i>from 3D coords, 128 keys, 2-4 neighbors</i>]
@@ -443,6 +529,32 @@ flowchart TD
 ### Step 5 — Atom Decoder (`CompactStreamingDecoder`, 3 blocks)
 
 The decoder wraps 3 `StructureLocalAtomTransformerBlock`s with cross-scale Upcast/Downcast layers. Each block refines atom features while incorporating token-level context.
+
+#### Simplified (Presentation)
+
+```mermaid
+flowchart LR
+    AI["A_I\n(token)"] --> UP1["Upcast\n(cross-attn)"] --> BLK1["Atom Block 1"] --> UP2["Upcast"] --> BLK2["Atom Block 2"] --> UP3["Upcast"] --> BLK3["Atom Block 3"] --> DC["Downcast\n(cross-attn)"]
+    QL["Q_L\n(atom)"] --> UP1
+    DC --> AI_OUT["A_I\n(updated)"]
+    BLK3 --> QL_OUT["Q_L\n(refined)"]
+
+    style AI fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style QL fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style UP1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style UP2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style UP3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style BLK1 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style BLK2 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style BLK3 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style DC fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style AI_OUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style QL_OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+```
+
+**Upcast** injects token-level context into atoms via cross-attention. **Blocks** refine atoms locally. **Downcast** pools atom info back to tokens.
+
+#### Detailed
 
 ```mermaid
 flowchart TD
