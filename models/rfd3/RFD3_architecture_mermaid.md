@@ -34,12 +34,49 @@ flowchart LR
 
 ---
 
-## Description
-- **Input:** Raw features, coordinates, and timestep are provided to the model.
-- **Feature Initializer:** Prepares the model state from the input.
-- **Denoising Loop:** For each denoising step (diffusion timestep), the model runs several recycle steps to refine the state.
-- **Recycle Loop:** Each recycle step passes through AtomEncoder, TokenEncoder, TokenTransformer, Decoder, and Heads. The loop repeats for a set number of recycles per denoising step.
-- **Post-processing:** After recycling, the model post-processes the output.
-- **Output:** The process repeats for each denoising step until the final structure and metadata are produced.
+## Detailed Description
 
-This diagram reflects the actual implementation and control flow in the RFD3 codebase, with the recycle loop nested inside the denoising loop, and all major modules shown in their correct order.
+This diagram represents the actual implementation and control flow in the RFD3 codebase, with the recycle loop nested inside the denoising loop. Each component and step is described below:
+
+1. **Input:**
+    - The model receives raw features (such as sequence, MSA, templates), atom coordinates, and the current diffusion timestep.
+
+2. **Feature Initializer:**
+    - Prepares the initial model state from the input features and coordinates.
+    - Embeds and projects the input data into the internal representations required for downstream processing.
+
+3. **Step Input:**
+    - Represents the current state at diffusion step $t$ (i.e., $X_t$, $t$, and features $f$).
+    - This node is the entry point for each denoising (diffusion) step.
+
+4. **TokenInitializer:**
+    - Initializes the state for the current denoising step.
+    - Sets up the token-level and pairwise representations that will be refined in the recycle loop.
+
+5. **Recycle Loop (Refinement):**
+    - For each denoising step, the model performs several recycle iterations to iteratively refine the representations.
+    - **AtomEncoder:** Applies local atom-level attention and encodes atom features.
+    - **TokenEncoder:** Encodes token-level features, often aggregating information from atoms to tokens.
+    - **TokenTransformer:** Applies transformer layers to token representations, enabling global or local context mixing.
+    - **Decoder:** Refines the representations and prepares them for output heads.
+    - **Heads:** Produces predictions such as distograms, sequence logits, and other auxiliary outputs.
+    - The loop repeats for a set number of recycles, with outputs from Heads feeding back to AtomEncoder for further refinement.
+
+6. **Post-processing (scale_positions_out):**
+    - After the final recycle iteration, the model post-processes the refined representations.
+    - This typically involves scaling or transforming coordinates and preparing outputs for the next denoising step.
+
+7. **Step Output:**
+    - Produces the denoised coordinates $X_{t-1}$ and other predictions for the current step.
+    - If more denoising steps remain, the output is fed back as the next step's input.
+
+8. **Denoising Loop:**
+    - The outer loop iterates over diffusion timesteps, each time running the recycle loop and post-processing.
+    - The process continues until the final timestep is reached.
+
+9. **Output:**
+    - After all denoising steps are complete, the model outputs the final structure and any associated metadata or predictions.
+
+**Key Points:**
+- The recycle loop is nested inside the denoising loop, enabling multiple refinement steps per diffusion timestep.
+- All major modules are shown in their correct order, and the diagram accurately reflects the data/control flow in the RFD3 model codebase.
