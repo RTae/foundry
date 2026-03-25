@@ -10,10 +10,11 @@ This diagram and description are based on the actual code and documentation for 
 flowchart LR
     IN[Input<br><i>Raw features, coordinates, timestep</i>]
     FI[Feature Initializer<br><i>Prepare model state from input</i>]
+    IN --> FI --> STEPIN[Step input<br><i>X_t, t, features</i>]
     subgraph DenoisingLoop["Denoising Loop (Diffusion Steps)"]
         direction LR
-        A1[Step input<br><i>X_t, t, features</i>]
-        A2[TokenInitializer<br><i>Initializes state for this step</i>]
+        STEPIN --> TKINIT[TokenInitializer<br><i>Initializes state for this step</i>]
+        TKINIT --> ENC
         subgraph RecycleLoop["Recycle Loop (Refinement)"]
             direction LR
             ENC[AtomEncoder<br><i>Local atom transformer</i>]
@@ -24,13 +25,11 @@ flowchart LR
             ENC --> TOK --> TR --> DEC --> HD
             HD -- "More recycle?" --> ENC
         end
-        A2 --> ENC
         HD --> OUT1[scale_positions_out<br><i>Post-processing</i>]
         OUT1 --> OUT2[Step output<br><i>X_t-1, predictions</i>]
-        OUT2 -- "More denoising steps?" --> A1
+        OUT2 -- "More denoising steps?" --> STEPIN
     end
     OUT2 --> FINAL[Output<br><i>Final structure, metadata</i>]
-    IN --> FI --> A1
 ```
 
 ---
