@@ -167,18 +167,22 @@ The same core block is wrapped differently depending on context. The encoder cha
 flowchart LR
     subgraph Encoder["Encoder (LocalAtomTransformer)"]
         direction LR
-        E_IN["Q_L"] --> EB1["Block 1\n(core)"] --> EB2["Block 2\n(core)"] --> EB3["Block 3\n(core)"] --> E_OUT["Q_L"]
+        E_IN["Q_L\n(atom features)"] --> EB1["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> EB2["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> EB3["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> E_OUT["Q_L\n(refined)"]
+        E_CL["C_L"] -.-> EB1 & EB2 & EB3
+        E_PLL["P_LL"] -.-> EB1 & EB2 & EB3
     end
 
     subgraph Decoder["Decoder (CompactStreamingDecoder)"]
         direction LR
-        D_AI["A_I\n(token)"] -.-> U1
-        D_QL["Q_L\n(atom)"] --> U1["Upcast"] --> DB1["Block 1\n(core)"] --> U2["Upcast"] --> DB2["Block 2\n(core)"] --> U3["Upcast"] --> DB3["Block 3\n(core)"] --> DC["Downcast"]
+        D_AI["A_I\n(token features)"] -.-> U1
+        D_QL["Q_L\n(atom features)"] --> U1["Upcast\nRMSNorm → Linear\n(broadcast A_I → atoms)"] --> DB1["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> U2["Upcast\nRMSNorm → Linear\n(broadcast)"] --> DB2["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> U3["Upcast\nRMSNorm → Linear\n(broadcast)"] --> DB3["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> DC["Downcast\nLinear → Mean Pool\n(atoms → token)"]
         D_AI -.-> U2
         D_AI -.-> U3
         D_AI -.-> DC
-        DC --> D_AI_OUT["A_I"]
-        DB3 --> D_QL_OUT["Q_L"]
+        D_CL["C_L"] -.-> DB1 & DB2 & DB3
+        D_PLL["P_LL"] -.-> DB1 & DB2 & DB3
+        DC --> D_AI_OUT["A_I\n(updated)"]
+        DB3 --> D_QL_OUT["Q_L\n(refined)"]
     end
 
     style E_IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
@@ -186,6 +190,8 @@ flowchart LR
     style EB1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style EB2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style EB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style E_CL fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style E_PLL fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
     style D_AI fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style D_QL fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
     style D_AI_OUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
@@ -197,6 +203,8 @@ flowchart LR
     style DB1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style DB2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style DB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style D_CL fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style D_PLL fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
 ```
 
 | | Encoder | Decoder |
