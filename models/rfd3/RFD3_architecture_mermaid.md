@@ -742,6 +742,116 @@ The paper says "same architecture" because both encoder and decoder use `Structu
 
 The **encoder**, by contrast, runs before any token-level processing and only needs to operate on atom-level features directly — no scale bridging needed.
 
+---
+
+### Generalized AtomTransformer Layer Architecture
+
+The diagram below shows the **shared core block** (`StructureLocalAtomTransformerBlock`) and how it generalizes to both encoder and decoder usage.
+
+#### Core Block — `StructureLocalAtomTransformerBlock`
+
+Every Atom Encoder block, Token Transformer block, and Decoder atom block uses this identical internal architecture:
+
+```mermaid
+flowchart TD
+    INPUT["Q_L (features)"] --> ADALN1["AdaLN\n(conditioned on C_L)"]
+    COND1["C_L (conditioning)"] -.-> ADALN1
+    ADALN1 --> QKV["Q / K / V Projections"]
+    PAIR["P_LL (pair features)"] --> BIAS["Pair Bias\nProjection"]
+    QKV --> ATTN["Sparse Local Attention\n+ Pair Bias"]
+    BIAS --> ATTN
+    ATTN --> GATE1["Gated Output\nσ(Linear(C_L)) × Linear(attn)"]
+    COND1b["C_L"] -.-> GATE1
+    GATE1 --> DROP["Dropout"]
+    DROP --> RES1["⊕ Residual"]
+    INPUT --> RES1
+
+    RES1 --> ADALN2["AdaLN\n(conditioned on C_L)"]
+    COND2["C_L"] -.-> ADALN2
+    ADALN2 --> SWIGLU["SwiGLU\nSiLU(Linear₁) × Linear₂ → Linear₃"]
+    SWIGLU --> GATE2["Gated Output\nσ(Linear(C_L)) × output"]
+    COND2b["C_L"] -.-> GATE2
+    GATE2 --> RES2["⊕ Residual"]
+    RES1 --> RES2
+    RES2 --> OUTPUT["Q_L (updated)"]
+
+    style INPUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style OUTPUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style ADALN1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style ADALN2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style QKV fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style ATTN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style BIAS fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style PAIR fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style GATE1 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style GATE2 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style DROP fill:#f5f5f5,stroke:#9E9E9E,stroke-width:1px,color:#616161
+    style SWIGLU fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style RES1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style RES2 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style COND1 fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style COND1b fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style COND2 fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+    style COND2b fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
+```
+
+The block has two residual sub-layers:
+1. **Attention sub-layer**: AdaLN → Q/K/V projection → sparse local attention with pair bias → gated output → residual add
+2. **Transition sub-layer**: AdaLN → SwiGLU MLP (SiLU gating) → gated output → residual add
+
+Both sub-layers use **AdaLN** (Adaptive Layer Norm) conditioned on `C_L` and **gated output** modulated by `C_L`.
+
+#### Encoder vs Decoder Wrapping
+
+The same core block is wrapped differently depending on the context:
+
+```mermaid
+flowchart LR
+    subgraph Encoder["Encoder (LocalAtomTransformer)"]
+        direction LR
+        E_IN["Q_L"] --> EB1["Block 1\n(core)"] --> EB2["Block 2\n(core)"] --> EB3["Block 3\n(core)"] --> E_OUT["Q_L"]
+    end
+
+    subgraph Decoder["Decoder (CompactStreamingDecoder)"]
+        direction LR
+        D_AI["A_I\n(token)"] -.-> U1
+        D_QL["Q_L\n(atom)"] --> U1["Upcast"] --> DB1["Block 1\n(core)"] --> U2["Upcast"] --> DB2["Block 2\n(core)"] --> U3["Upcast"] --> DB3["Block 3\n(core)"] --> DC["Downcast"]
+        D_AI -.-> U2
+        D_AI -.-> U3
+        D_AI -.-> DC
+        DC --> D_AI_OUT["A_I"]
+        DB3 --> D_QL_OUT["Q_L"]
+    end
+
+    style E_IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style E_OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style EB1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style EB2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style EB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style D_AI fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style D_QL fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style D_AI_OUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style D_QL_OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style U1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style U2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style U3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style DC fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style DB1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style DB2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style DB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+```
+
+| | Encoder | Decoder |
+|---|---------|---------|
+| **Wrapping** | None — blocks run directly | Upcast before each block, Downcast after all blocks |
+| **Upcast** | — | Injects token-level `A_I` into atom-level `Q_L` via cross-attention or broadcast |
+| **Downcast** | — | Pools atom-level `Q_L` back to token-level `A_I` via mean-pooling or cross-attention |
+| **Core block** | `StructureLocalAtomTransformerBlock` (identical) | `StructureLocalAtomTransformerBlock` (identical) |
+
+The core block (blue) is **identical** in both cases — only the outer wrapping differs.
+
+---
+
 
 ## Step-by-Step Model Flow
 
