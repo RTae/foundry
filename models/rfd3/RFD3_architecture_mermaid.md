@@ -53,134 +53,378 @@ flowchart LR
 
 ## Block-by-Block Layer Breakdown
 
+---
+
 ### Feature Initializer (TokenInitializer)
 
 The Feature Initializer prepares the model's internal representations from raw input features. It embeds residue and atomic features, builds pairwise representations, and runs a small Pairformer stack for initial mixing.
 
 ```mermaid
 flowchart TD
-    subgraph FeatureInitializer["Feature Initializer (TokenInitializer)"]
+    subgraph Embedders["1. Feature Embedding"]
         direction TB
-        A1[Atom 1D Embedder x2<br><i>Embed atomic features</i>]
-        A2[Token 1D Embedder<br><i>Embed residue features</i>]
-        A3[Downcast: Atom to Token<br><i>Pool atom reps to token level</i>]
-        A4[Pairwise Init<br><i>Relative position encoding<br>Bond features<br>Distance embedding</i>]
-        A5[PairformerBlock x2<br><i>S_I and Z_II mixing<br>Attention + Transition</i>]
-        A6[Atom Pair MLP<br><i>ReLU, Linear x3<br>Build P_LL</i>]
-        A1 --> A3
-        A2 --> A3
-        A3 --> A4 --> A5 --> A6
+        A1a[Linear: atom features to c_atom]
+        A1b[ReLU activation]
+        A1c[Linear: c_atom to c_atom]
+        A2a[Linear: token features to c_s]
+        A2b[ReLU activation]
+        A2c[Linear: c_s to c_s]
+        A1a --> A1b --> A1c
+        A2a --> A2b --> A2c
     end
 
-    style A1 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
-    style A2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style A3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style A4 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
-    style A5 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
-    style A6 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
-    style FeatureInitializer fill:#fffde7,stroke:#FBC02D,stroke-width:2px
+    subgraph Downcast["2. Downcast: Atom to Token"]
+        direction TB
+        DC1[Gather atoms per token]
+        DC2[Weighted sum pooling]
+        DC3[Output: S_init_I]
+        DC1 --> DC2 --> DC3
+    end
+
+    subgraph PairInit["3. Pairwise Representation Init"]
+        direction TB
+        P1[LinearNoBias: S to Z_i]
+        P2[LinearNoBias: S to Z_j]
+        P3[Outer sum: Z_init_II = Z_i + Z_j]
+        P4[RelativePositionEncoding x2]
+        P5[LinearNoBias: bond features]
+        P6[PositionPairDistEmbedder]
+        P7[Sum all into Z_init_II]
+        P1 --> P3
+        P2 --> P3
+        P3 --> P7
+        P4 --> P7
+        P5 --> P7
+        P6 --> P7
+    end
+
+    subgraph Pairformer["4. PairformerBlock x2"]
+        direction TB
+        PF1[AttentionPairBias<br><i>Multi-head attention on S_I<br>with bias from Z_II</i>]
+        PF2[Transition: S_I<br><i>RMSNorm, Linear, SiLU, Linear</i>]
+        PF3[Transition: Z_II<br><i>RMSNorm, Linear, SiLU, Linear</i>]
+        PF4[Residual connections on S_I and Z_II]
+        PF1 --> PF2 --> PF3 --> PF4
+    end
+
+    subgraph AtomPairMLP["5. Atom Pair MLP: Build P_LL"]
+        direction TB
+        M1[Linear: project single_l, single_m]
+        M2[Linear: project Z_II to atom level]
+        M3[SinusoidalDistEmbed: motif positions]
+        M4[PositionPairDistEmbedder: ref positions]
+        M5[Sum all pair contributions]
+        M6[ReLU, Linear]
+        M7[ReLU, Linear]
+        M8[ReLU, Linear]
+        M9[Output: P_LL]
+        M1 --> M5
+        M2 --> M5
+        M3 --> M5
+        M4 --> M5
+        M5 --> M6 --> M7 --> M8 --> M9
+    end
+
+    Embedders --> Downcast --> PairInit --> Pairformer --> AtomPairMLP
+
+    style A1a fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style A1b fill:#e8f5e9,stroke:#4CAF50,stroke-width:1px,color:#1B5E20
+    style A1c fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style A2a fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style A2b fill:#e3f2fd,stroke:#1976D2,stroke-width:1px,color:#0D47A1
+    style A2c fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style DC1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style DC2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style DC3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style P1 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style P2 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style P3 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style P4 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style P5 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style P6 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style P7 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style PF1 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style PF2 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style PF3 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style PF4 fill:#fce4ec,stroke:#E91E63,stroke-width:1px,color:#880E4F
+    style M1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style M2 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style M3 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style M4 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style M5 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style M6 fill:#e0f2f1,stroke:#009688,stroke-width:1px,color:#004D40
+    style M7 fill:#e0f2f1,stroke:#009688,stroke-width:1px,color:#004D40
+    style M8 fill:#e0f2f1,stroke:#009688,stroke-width:1px,color:#004D40
+    style M9 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style Embedders fill:#f1f8e9,stroke:#8BC34A,stroke-width:2px
+    style Downcast fill:#fff8e1,stroke:#FFC107,stroke-width:2px
+    style PairInit fill:#f3e5f5,stroke:#AB47BC,stroke-width:2px
+    style Pairformer fill:#fce4ec,stroke:#EC407A,stroke-width:2px
+    style AtomPairMLP fill:#e0f2f1,stroke:#26A69A,stroke-width:2px
 ```
 
-- **Atom 1D Embedders:** Two embedding layers that project raw atomic features into model space.
-- **Token 1D Embedder:** Embeds residue-level features.
-- **Downcast:** Pools atom representations to the token (residue) level.
-- **Pairwise Init:** Builds initial pairwise representations using relative position encoding, bond features, and distance embeddings.
-- **PairformerBlock x2:** Two Pairformer blocks that mix single (S_I) and pair (Z_II) representations via attention and transition layers.
-- **Atom Pair MLP:** Builds atom-level pairwise features (P_LL) using a 3-layer ReLU + Linear MLP.
+- **Feature Embedding:** Two parallel paths — atom features and token features — each go through Linear + ReLU + Linear to produce initial embeddings.
+- **Downcast:** Gathers atoms belonging to each token and pools them via weighted sum to produce token-level representations (S_init_I).
+- **Pairwise Init:** Builds Z_init_II by outer-summing projected single reps, then adding relative position encodings, bond features, and distance embeddings.
+- **PairformerBlock x2:** Each block runs AttentionPairBias on S_I (with bias from Z_II), then two separate Transition layers (RMSNorm → Linear → SiLU → Linear) for S_I and Z_II, with residual connections.
+- **Atom Pair MLP:** Collects projections of single reps, Z_II, motif distances, and reference distances, sums them, then passes through 3 layers of ReLU → Linear to produce P_LL.
 
+---
 
-### Atom Transformer (LocalAtomTransformer)
+### Atom Transformer (LocalAtomTransformer, 3 blocks)
 
-The Atom Transformer processes atom-level features using sparse local attention and gated feed-forward layers. Each of the 3 blocks shares the same architecture.
+Each of the 3 blocks is a `StructureLocalAtomTransformerBlock`. The attention and MLP sub-layers are broken down below.
 
 ```mermaid
 flowchart TD
-    subgraph AtomTransformerBlock["Atom Transformer Block (x3)"]
+    INPUT[Q_L input] --> BLOCK1
+
+    subgraph BLOCK1["Block 1 of 3"]
         direction TB
-        B1[AdaLN / RMSNorm<br><i>Conditional or standard normalization</i>]
-        B2[Local Attention with Pair Bias<br><i>Sparse multi-head self-attention<br>Q/K normalization<br>Pair bias from P_LL<br>Gating via Sigmoid</i>]
-        B3[Residual Connection]
-        B4[Conditioned Transition / SwiGLU MLP<br><i>AdaLN + SwiGLU gated MLP<br>or RMSNorm + Linear x2 + SiLU</i>]
-        B5[Residual Connection]
-        B1 --> B2 --> B3 --> B4 --> B5
+        subgraph Attn1["Local Attention with Pair Bias"]
+            direction TB
+            N1[AdaLN: condition on C_L<br><i>Scale and shift from single reps</i>]
+            QKV1[LinearNoBias: Q, K, V projections]
+            QKNORM1[RMSNorm on Q and K]
+            GATHER1[Gather sparse attention indices]
+            BIAS1[LinearNoBias: P_LL to per-head bias]
+            SDPA1[Scaled Dot-Product Attention<br><i>with pair bias, sparse</i>]
+            GATE1[Linear + Sigmoid gating]
+            OUT1A[LinearNoBias: output projection]
+            N1 --> QKV1 --> QKNORM1 --> SDPA1
+            GATHER1 --> SDPA1
+            BIAS1 --> SDPA1
+            SDPA1 --> GATE1 --> OUT1A
+        end
+        RES1[+ Residual: Q_L = Q_L + attn_out]
+        subgraph MLP1["Conditioned Transition (SwiGLU)"]
+            direction TB
+            AN1[AdaLN: condition on C_L]
+            LIN1A[Linear: c_atom to 4*c_atom]
+            LIN1B[Linear: c_atom to 4*c_atom]
+            SILU1[SiLU activation on branch A]
+            MULT1[Element-wise multiply: SiLU_A * B]
+            LIN1C[Linear: 4*c_atom to c_atom]
+            AN1 --> LIN1A --> SILU1 --> MULT1
+            AN1 --> LIN1B --> MULT1
+            MULT1 --> LIN1C
+        end
+        RES1B[+ Residual: Q_L = Q_L + mlp_out]
+        Attn1 --> RES1 --> MLP1 --> RES1B
     end
 
-    style B1 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
-    style B2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style B3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style B4 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
-    style B5 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style AtomTransformerBlock fill:#e8f5e9,stroke:#388E3C,stroke-width:2px
+    BLOCK1 --> REPEAT["Repeat for Block 2 and Block 3<br><i>Same architecture, shared weights within each block</i>"]
+    REPEAT --> OUTQ[Q_L output]
+
+    style INPUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style N1 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style QKV1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style QKNORM1 fill:#e3f2fd,stroke:#1976D2,stroke-width:1px,color:#0D47A1
+    style GATHER1 fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style BIAS1 fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style SDPA1 fill:#e3f2fd,stroke:#1565C0,stroke-width:2px,color:#0D47A1
+    style GATE1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style OUT1A fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style RES1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style AN1 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style LIN1A fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style LIN1B fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style SILU1 fill:#f3e5f5,stroke:#9C27B0,stroke-width:1px,color:#6A1B9A
+    style MULT1 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style LIN1C fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style RES1B fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style REPEAT fill:#fafafa,stroke:#9E9E9E,stroke-width:2px,stroke-dasharray:5 5,color:#616161
+    style OUTQ fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style Attn1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px
+    style MLP1 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+    style BLOCK1 fill:#e8f5e9,stroke:#388E3C,stroke-width:2px
 ```
 
-- **AdaLN / RMSNorm:** Normalizes input, optionally conditioned on single representations (AdaLN-Zero style).
-- **Local Attention with Pair Bias:** Sparse multi-head self-attention over atom features, using Q/K normalization and pair bias from atom-pair features (P_LL). Output is gated via sigmoid.
-- **Residual Connection:** Adds the attention output back to the input.
-- **Conditioned Transition / SwiGLU MLP:** Feed-forward block using AdaLN + SwiGLU gating, or RMSNorm + two linear layers with SiLU activation.
-- **Residual Connection:** Adds the MLP output back to the input.
+**Attention sub-layer:**
+- **AdaLN:** Adaptive Layer Normalization conditioned on single representations (C_L). Produces scale/shift parameters.
+- **Q, K, V projections:** Three separate LinearNoBias layers projecting input to query, key, and value.
+- **Q/K RMSNorm:** Normalizes query and key vectors for stable attention.
+- **Sparse index gathering:** Collects attention indices (nearest neighbors in 3D space).
+- **Pair bias:** Projects P_LL to per-head bias via LinearNoBias, added to attention logits.
+- **Scaled Dot-Product Attention:** Computes sparse attention with pair bias.
+- **Sigmoid gating:** Linear → Sigmoid produces a gate that modulates the attention output.
+- **Output projection:** LinearNoBias maps back to model dimension.
 
+**MLP sub-layer (SwiGLU):**
+- **AdaLN:** Conditions on C_L.
+- **Two parallel Linear projections:** Both map c_atom → 4*c_atom.
+- **SiLU on branch A:** Applies SiLU activation to one branch.
+- **Element-wise multiply:** Multiplies the SiLU branch with the gate branch (SwiGLU pattern).
+- **Linear projection:** Maps 4*c_atom back to c_atom.
 
-### Token Transformer (LocalTokenTransformer)
+---
 
-The Token Transformer processes token-level (residue-level) features. It uses the same block architecture as the Atom Transformer, but operates at the token level with 18 blocks and sparse attention indices computed from 3D coordinates.
+### Token Transformer (LocalTokenTransformer, 18 blocks)
+
+Uses the same `StructureLocalAtomTransformerBlock` as the Atom Transformer, but operates on token-level features (A_I) with pair bias from Z_II. Sparse attention indices are built from 3D coordinates (128 keys, 2-4 neighbors).
 
 ```mermaid
 flowchart TD
-    subgraph TokenTransformerBlock["Token Transformer Block (x18)"]
+    TINPUT[A_I input] --> IDX[Build sparse attention indices<br><i>from 3D coords, 128 keys, 2-4 neighbors</i>]
+    IDX --> TBLOCK1
+
+    subgraph TBLOCK1["Block 1 of 18"]
         direction TB
-        C1[AdaLN / RMSNorm<br><i>Conditional or standard normalization</i>]
-        C2[Local Attention with Pair Bias<br><i>Sparse multi-head self-attention<br>128 keys, 2-4 neighbors<br>Pair bias from Z_II<br>Gating via Sigmoid</i>]
-        C3[Residual Connection]
-        C4[Conditioned Transition / SwiGLU MLP<br><i>AdaLN + SwiGLU gated MLP<br>or RMSNorm + Linear x2 + SiLU</i>]
-        C5[Residual Connection]
-        C1 --> C2 --> C3 --> C4 --> C5
+        subgraph TAttn["Local Attention with Pair Bias"]
+            direction TB
+            TN1[AdaLN: condition on S_I<br><i>Scale and shift from single reps</i>]
+            TQKV[LinearNoBias: Q, K, V projections]
+            TQKNORM[RMSNorm on Q and K]
+            TGATHER[Gather sparse attention indices]
+            TBIAS[LinearNoBias: Z_II to per-head bias]
+            TSDPA[Scaled Dot-Product Attention<br><i>with pair bias, sparse or full</i>]
+            TGATE[Linear + Sigmoid gating]
+            TOUT[LinearNoBias: output projection]
+            TN1 --> TQKV --> TQKNORM --> TSDPA
+            TGATHER --> TSDPA
+            TBIAS --> TSDPA
+            TSDPA --> TGATE --> TOUT
+        end
+        TRES1[+ Residual: A_I = A_I + attn_out]
+        subgraph TMLP["Conditioned Transition (SwiGLU)"]
+            direction TB
+            TAN[AdaLN: condition on S_I]
+            TLIN1[Linear: c_s to 4*c_s]
+            TLIN2[Linear: c_s to 4*c_s]
+            TSILU[SiLU activation on branch A]
+            TMULT[Element-wise multiply: SiLU_A * B]
+            TLIN3[Linear: 4*c_s to c_s]
+            TAN --> TLIN1 --> TSILU --> TMULT
+            TAN --> TLIN2 --> TMULT
+            TMULT --> TLIN3
+        end
+        TRES2[+ Residual: A_I = A_I + mlp_out]
+        TAttn --> TRES1 --> TMLP --> TRES2
     end
 
-    style C1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style C2 fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
-    style C3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style C4 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
-    style C5 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style TokenTransformerBlock fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
+    TBLOCK1 --> TREPEAT["Repeat for Blocks 2-18<br><i>Same architecture per block</i>"]
+    TREPEAT --> TOUTQ[A_I output]
+
+    style TINPUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style IDX fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style TN1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TQKV fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TQKNORM fill:#e3f2fd,stroke:#1976D2,stroke-width:1px,color:#0D47A1
+    style TGATHER fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style TBIAS fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style TSDPA fill:#e3f2fd,stroke:#1565C0,stroke-width:2px,color:#0D47A1
+    style TGATE fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style TOUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TRES1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style TAN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TLIN1 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style TLIN2 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style TSILU fill:#ede7f6,stroke:#673AB7,stroke-width:1px,color:#311B92
+    style TMULT fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style TLIN3 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style TRES2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style TREPEAT fill:#fafafa,stroke:#9E9E9E,stroke-width:2px,stroke-dasharray:5 5,color:#616161
+    style TOUTQ fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TAttn fill:#e3f2fd,stroke:#1976D2,stroke-width:2px
+    style TMLP fill:#ede7f6,stroke:#673AB7,stroke-width:2px
+    style TBLOCK1 fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
 ```
 
-- **AdaLN / RMSNorm:** Normalizes input, optionally conditioned on single representations.
-- **Local Attention with Pair Bias:** Sparse multi-head self-attention over token features, using 128 attention keys and 2-4 sequence neighbors. Pair bias is derived from Z_II. Output is gated via sigmoid.
-- **Residual Connection:** Adds the attention output back to the input.
-- **Conditioned Transition / SwiGLU MLP:** Feed-forward block using AdaLN + SwiGLU gating, or RMSNorm + two linear layers with SiLU activation.
-- **Residual Connection:** Adds the MLP output back to the input.
+**Key differences from Atom Transformer:**
+- Operates on token-level reps (A_I) instead of atom-level (Q_L).
+- Pair bias comes from Z_II (token-pair) instead of P_LL (atom-pair).
+- Conditioned on S_I (token single reps) instead of C_L (atom conditioning).
+- Uses 128 attention keys with 2-4 spatial neighbors for sparse attention.
+- 18 blocks (vs. 3 for atom transformer) — this is the largest computation in each recycle.
 
+---
 
-### DiffusionTokenEncoder (Self-Conditioning, between Atom Encoder and Token Transformer)
+### DiffusionTokenEncoder (Self-Conditioning)
 
-The DiffusionTokenEncoder sits between the Atom Encoder and Token Transformer. It conditions the token and pair representations using noise-level and distogram information.
+Sits between the Atom Encoder and Token Transformer. Conditions token and pair representations using noise-level and distogram information.
 
 ```mermaid
 flowchart TD
-    subgraph DiffusionTokenEncoder["DiffusionTokenEncoder"]
+    subgraph SinglePath["Single Representation Path (S_I)"]
         direction TB
-        D1[Transition x2<br><i>Refine S_I single reps</i>]
-        D2[Distogram Embedding<br><i>Sinusoidal or 65-bin bucketed<br>from noisy coords</i>]
-        D3[Concatenate Z_II + Distogram<br><i>RMSNorm, Linear projection</i>]
-        D4[Pair Transition x2<br><i>Refine Z_II pair reps</i>]
-        D5[PairformerBlock x2<br><i>S_I and Z_II mixing<br>Attention + Transition</i>]
-        D1 --> D5
-        D2 --> D3 --> D4 --> D5
+        S1[RMSNorm]
+        S2[Linear: c_s to 2*c_s]
+        S3[SiLU activation]
+        S4[Linear: 2*c_s to c_s]
+        S5[Residual connection]
+        S6["Repeat Transition x2"]
+        S1 --> S2 --> S3 --> S4 --> S5 --> S6
     end
 
-    style D1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
-    style D2 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    subgraph PairPath["Pair Representation Path (Z_II)"]
+        direction TB
+        D1[Compute pairwise distances from R_L]
+        D2a[SinusoidalDistEmbed: distances to c_z]
+        D2b[Bucketize: 65-bin Gaussian PDF]
+        D3[Concatenate: Z_init_II + distogram]
+        D4[RMSNorm]
+        D5[Linear: cat_c_z to c_z]
+        D6[RMSNorm, Linear, SiLU, Linear]
+        D7[Residual connection]
+        D8["Repeat Pair Transition x2"]
+        D1 --> D2a --> D3
+        D1 --> D2b --> D3
+        D3 --> D4 --> D5 --> D6 --> D7 --> D8
+    end
+
+    subgraph PairformerMix["PairformerBlock x2: S_I and Z_II Mixing"]
+        direction TB
+        PFa[AttentionPairBias on S_I<br><i>with bias from Z_II</i>]
+        PFb[Transition: S_I<br><i>RMSNorm, Linear, SiLU, Linear</i>]
+        PFc[Transition: Z_II<br><i>RMSNorm, Linear, SiLU, Linear</i>]
+        PFd[Residual connections]
+        PFe["Repeat PairformerBlock x2"]
+        PFa --> PFb --> PFc --> PFd --> PFe
+    end
+
+    SinglePath --> PairformerMix
+    PairPath --> PairformerMix
+    PairformerMix --> ENCOUT[Output: S_I, Z_II<br><i>Conditioned on noise and distogram</i>]
+
+    style S1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style S2 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style S3 fill:#e0f2f1,stroke:#009688,stroke-width:1px,color:#004D40
+    style S4 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style S5 fill:#e0f2f1,stroke:#009688,stroke-width:1px,color:#004D40
+    style S6 fill:#e0f2f1,stroke:#009688,stroke-width:2px,stroke-dasharray:3 3,color:#004D40
+    style D1 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style D2a fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style D2b fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
     style D3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style D4 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
-    style D5 fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
-    style DiffusionTokenEncoder fill:#fafafa,stroke:#607D8B,stroke-width:2px
+    style D4 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style D5 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style D6 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style D7 fill:#f3e5f5,stroke:#9C27B0,stroke-width:1px,color:#6A1B9A
+    style D8 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,stroke-dasharray:3 3,color:#6A1B9A
+    style PFa fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style PFb fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style PFc fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style PFd fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
+    style PFe fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,stroke-dasharray:3 3,color:#1A237E
+    style ENCOUT fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style SinglePath fill:#e0f7fa,stroke:#00ACC1,stroke-width:2px
+    style PairPath fill:#fce4ec,stroke:#EC407A,stroke-width:2px
+    style PairformerMix fill:#e8eaf6,stroke:#5C6BC0,stroke-width:2px
 ```
 
-- **Transition x2:** Two transition layers (RMSNorm + Linear + SiLU) to refine the single representation (S_I).
-- **Distogram Embedding:** Embeds pairwise distances from noisy coordinates, using sinusoidal embedding or 65-bin Gaussian PDF bucketing.
-- **Concatenate + Project:** Concatenates Z_II with the distogram embedding, then applies RMSNorm and a linear projection.
-- **Pair Transition x2:** Two transition layers to refine the pair representation (Z_II).
-- **PairformerBlock x2:** Two Pairformer blocks that mix single and pair representations via attention and transition layers.
+**Single Representation Path (S_I):**
+- Two Transition layers, each: RMSNorm → Linear (expand) → SiLU → Linear (contract) → Residual.
+
+**Pair Representation Path (Z_II):**
+- Compute pairwise distances from noisy coordinates (R_L).
+- Embed distances via SinusoidalDistEmbed (continuous) or 65-bin Gaussian PDF bucketing (discrete).
+- Concatenate Z_init_II with distogram embedding.
+- Project via RMSNorm → Linear to c_z.
+- Two Pair Transition layers: RMSNorm → Linear → SiLU → Linear → Residual.
+
+**PairformerBlock x2:**
+- Each block: AttentionPairBias on S_I (bias from Z_II), then separate Transition layers for S_I and Z_II, with residual connections.
+- Repeated twice for deeper mixing.
 
 
 ### Summary Table
