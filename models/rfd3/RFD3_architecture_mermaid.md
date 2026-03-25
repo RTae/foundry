@@ -53,9 +53,13 @@ flowchart LR
 
 ## Block-by-Block Layer Breakdown
 
+Each component below is presented in **pipeline execution order** — the order data flows through during each recycling iteration of a denoising step:
+
+> **Feature Initializer** ➜ **Atom Encoder** ➜ **DiffusionTokenEncoder** ➜ **Token Transformer** ➜ **Atom Decoder**
+
 ---
 
-### Feature Initializer (TokenInitializer)
+### Step 1 — Feature Initializer (`TokenInitializer`)
 
 The Feature Initializer prepares the model's internal representations from raw input features. It embeds residue and atomic features, builds pairwise representations, and runs a small Pairformer stack for initial mixing.
 
@@ -169,9 +173,11 @@ flowchart TD
 - **PairformerBlock x2:** Each block runs AttentionPairBias on S_I (with bias from Z_II), then two separate Transition layers (RMSNorm → Linear → SiLU → Linear) for S_I and Z_II, with residual connections.
 - **Atom Pair MLP:** Collects projections of single reps, Z_II, motif distances, and reference distances, sums them, then passes through 3 layers of ReLU → Linear to produce P_LL.
 
+
+> **Pipeline:** Step 1 outputs `Q_L`, `C_L`, `S_I`, `Z_II`, `P_LL` — atom and token representations ready for the recycling loop.
 ---
 
-### Atom Transformer (LocalAtomTransformer, 3 blocks)
+### Step 2 — Atom Encoder (`LocalAtomTransformer`, 3 blocks)
 
 Each of the 3 blocks is a `StructureLocalAtomTransformerBlock`. The attention and MLP sub-layers are broken down below.
 
@@ -257,89 +263,11 @@ flowchart TD
 - **Element-wise multiply:** Multiplies the SiLU branch with the gate branch (SwiGLU pattern).
 - **Linear projection:** Maps 4*c_atom back to c_atom.
 
+
+> **Pipeline:** Atom encoder outputs refined `Q_L` (atom features). These, along with `S_I` and `Z_II`, feed into the DiffusionTokenEncoder.
 ---
 
-### Token Transformer (LocalTokenTransformer, 18 blocks)
-
-Uses the same `StructureLocalAtomTransformerBlock` as the Atom Transformer, but operates on token-level features (A_I) with pair bias from Z_II. Sparse attention indices are built from 3D coordinates (128 keys, 2-4 neighbors).
-
-```mermaid
-flowchart TD
-    TINPUT[A_I input] --> IDX[Build sparse attention indices<br><i>from 3D coords, 128 keys, 2-4 neighbors</i>]
-    IDX --> TBLOCK1
-
-    subgraph TBLOCK1["Block 1 of 18"]
-        direction TB
-        subgraph TAttn["Local Attention with Pair Bias"]
-            direction TB
-            TN1[AdaLN: condition on S_I<br><i>Scale and shift from single reps</i>]
-            TQKV[LinearNoBias: Q, K, V projections]
-            TQKNORM[RMSNorm on Q and K]
-            TGATHER[Gather sparse attention indices]
-            TBIAS[LinearNoBias: Z_II to per-head bias]
-            TSDPA[Scaled Dot-Product Attention<br><i>with pair bias, sparse or full</i>]
-            TGATE[Linear + Sigmoid gating]
-            TOUT[LinearNoBias: output projection]
-            TN1 --> TQKV --> TQKNORM --> TSDPA
-            TGATHER --> TSDPA
-            TBIAS --> TSDPA
-            TSDPA --> TGATE --> TOUT
-        end
-        TRES1[+ Residual: A_I = A_I + attn_out]
-        subgraph TMLP["Conditioned Transition (SwiGLU)"]
-            direction TB
-            TAN[AdaLN: condition on S_I]
-            TLIN1[Linear: c_s to 4*c_s]
-            TLIN2[Linear: c_s to 4*c_s]
-            TSILU[SiLU activation on branch A]
-            TMULT[Element-wise multiply: SiLU_A * B]
-            TLIN3[Linear: 4*c_s to c_s]
-            TAN --> TLIN1 --> TSILU --> TMULT
-            TAN --> TLIN2 --> TMULT
-            TMULT --> TLIN3
-        end
-        TRES2[+ Residual: A_I = A_I + mlp_out]
-        TAttn --> TRES1 --> TMLP --> TRES2
-    end
-
-    TBLOCK1 --> TREPEAT["Repeat for Blocks 2-18<br><i>Same architecture per block</i>"]
-    TREPEAT --> TOUTQ[A_I output]
-
-    style TINPUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style IDX fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
-    style TN1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style TQKV fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style TQKNORM fill:#e3f2fd,stroke:#1976D2,stroke-width:1px,color:#0D47A1
-    style TGATHER fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
-    style TBIAS fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
-    style TSDPA fill:#e3f2fd,stroke:#1565C0,stroke-width:2px,color:#0D47A1
-    style TGATE fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style TOUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style TRES1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style TAN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style TLIN1 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
-    style TLIN2 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
-    style TSILU fill:#ede7f6,stroke:#673AB7,stroke-width:1px,color:#311B92
-    style TMULT fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
-    style TLIN3 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
-    style TRES2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
-    style TREPEAT fill:#fafafa,stroke:#9E9E9E,stroke-width:2px,stroke-dasharray:5 5,color:#616161
-    style TOUTQ fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style TAttn fill:#e3f2fd,stroke:#1976D2,stroke-width:2px
-    style TMLP fill:#ede7f6,stroke:#673AB7,stroke-width:2px
-    style TBLOCK1 fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
-```
-
-**Key differences from Atom Transformer:**
-- Operates on token-level reps (A_I) instead of atom-level (Q_L).
-- Pair bias comes from Z_II (token-pair) instead of P_LL (atom-pair).
-- Conditioned on S_I (token single reps) instead of C_L (atom conditioning).
-- Uses 128 attention keys with 2-4 spatial neighbors for sparse attention.
-- 18 blocks (vs. 3 for atom transformer) — this is the largest computation in each recycle.
-
----
-
-### DiffusionTokenEncoder (Self-Conditioning)
+### Step 3 — DiffusionTokenEncoder (Self-Conditioning)
 
 Sits between the Atom Encoder and Token Transformer. Conditions token and pair representations using noise-level and distogram information.
 
@@ -426,34 +354,93 @@ flowchart TD
 - Each block: AttentionPairBias on S_I (bias from Z_II), then separate Transition layers for S_I and Z_II, with residual connections.
 - Repeated twice for deeper mixing.
 
+
+> **Pipeline:** DiffusionTokenEncoder outputs noise-conditioned `S_I` and `Z_II`. These feed into the Token Transformer.
 ---
 
-### Encoder vs Decoder: Same Block, Different Architecture
+### Step 4 — Token Transformer (`LocalTokenTransformer`, 18 blocks)
 
-The paper describes the encoder and decoder as using the **same Atom Transformer architecture**. In the code, however, they are implemented as two distinct classes:
+Uses the same `StructureLocalAtomTransformerBlock` as the Atom Transformer, but operates on token-level features (A_I) with pair bias from Z_II. Sparse attention indices are built from 3D coordinates (128 keys, 2-4 neighbors).
 
-| Aspect | Encoder | Decoder |
-|--------|---------|--------|
-| **Class** | `LocalAtomTransformer` | `CompactStreamingDecoder` |
-| **Core block** | `StructureLocalAtomTransformerBlock` × 3 | `StructureLocalAtomTransformerBlock` × 3 |
-| **Upcast/Downcast** | None | Yes — cross-attention Upcast before each block, Downcast after all blocks |
-| **Input** | Atom-level only (`Q_L`, `C_L`, `P_LL`) | Token-level (`A_I`, `S_I`, `Z_II`) + Atom-level (`Q_L`, `C_L`, `P_LL`) |
-| **Output** | `Q_L` (atom features) | `(A_I, Q_L, offsets)` — both token and atom outputs |
-| **Dropout** | 0.0 | 0.10 |
-| **Scale bridging** | None — operates purely at atom level | Token ↔ Atom bridging via Upcast/Downcast |
+```mermaid
+flowchart TD
+    TINPUT[A_I input] --> IDX[Build sparse attention indices<br><i>from 3D coords, 128 keys, 2-4 neighbors</i>]
+    IDX --> TBLOCK1
 
-**Why are they different?**
+    subgraph TBLOCK1["Block 1 of 18"]
+        direction TB
+        subgraph TAttn["Local Attention with Pair Bias"]
+            direction TB
+            TN1[AdaLN: condition on S_I<br><i>Scale and shift from single reps</i>]
+            TQKV[LinearNoBias: Q, K, V projections]
+            TQKNORM[RMSNorm on Q and K]
+            TGATHER[Gather sparse attention indices]
+            TBIAS[LinearNoBias: Z_II to per-head bias]
+            TSDPA[Scaled Dot-Product Attention<br><i>with pair bias, sparse or full</i>]
+            TGATE[Linear + Sigmoid gating]
+            TOUT[LinearNoBias: output projection]
+            TN1 --> TQKV --> TQKNORM --> TSDPA
+            TGATHER --> TSDPA
+            TBIAS --> TSDPA
+            TSDPA --> TGATE --> TOUT
+        end
+        TRES1[+ Residual: A_I = A_I + attn_out]
+        subgraph TMLP["Conditioned Transition (SwiGLU)"]
+            direction TB
+            TAN[AdaLN: condition on S_I]
+            TLIN1[Linear: c_s to 4*c_s]
+            TLIN2[Linear: c_s to 4*c_s]
+            TSILU[SiLU activation on branch A]
+            TMULT[Element-wise multiply: SiLU_A * B]
+            TLIN3[Linear: 4*c_s to c_s]
+            TAN --> TLIN1 --> TSILU --> TMULT
+            TAN --> TLIN2 --> TMULT
+            TMULT --> TLIN3
+        end
+        TRES2[+ Residual: A_I = A_I + mlp_out]
+        TAttn --> TRES1 --> TMLP --> TRES2
+    end
 
-The paper says "same architecture" because both encoder and decoder use `StructureLocalAtomTransformerBlock` as their core repeating unit — identical local attention with pair bias + SwiGLU transition. However, the **decoder** sits after the Token Transformer, so it must fuse token-level predictions back into atom-level coordinates. This requires:
+    TBLOCK1 --> TREPEAT["Repeat for Blocks 2-18<br><i>Same architecture per block</i>"]
+    TREPEAT --> TOUTQ[A_I output]
 
-- **Upcast** (before each block): Projects token-level features (`A_I`) down to atom-level via cross-attention, so the atom transformer block can incorporate token-level information.
-- **Downcast** (after all blocks): Pools atom-level features back up to token-level via cross-attention, producing updated token representations for the recycling loop.
+    style TINPUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style IDX fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style TN1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TQKV fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TQKNORM fill:#e3f2fd,stroke:#1976D2,stroke-width:1px,color:#0D47A1
+    style TGATHER fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style TBIAS fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style TSDPA fill:#e3f2fd,stroke:#1565C0,stroke-width:2px,color:#0D47A1
+    style TGATE fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style TOUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TRES1 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style TAN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TLIN1 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style TLIN2 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style TSILU fill:#ede7f6,stroke:#673AB7,stroke-width:1px,color:#311B92
+    style TMULT fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style TLIN3 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style TRES2 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style TREPEAT fill:#fafafa,stroke:#9E9E9E,stroke-width:2px,stroke-dasharray:5 5,color:#616161
+    style TOUTQ fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style TAttn fill:#e3f2fd,stroke:#1976D2,stroke-width:2px
+    style TMLP fill:#ede7f6,stroke:#673AB7,stroke-width:2px
+    style TBLOCK1 fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
+```
 
-The **encoder**, by contrast, runs before any token-level processing and only needs to operate on atom-level features directly — no scale bridging needed.
+**Key differences from Atom Transformer:**
+- Operates on token-level reps (A_I) instead of atom-level (Q_L).
+- Pair bias comes from Z_II (token-pair) instead of P_LL (atom-pair).
+- Conditioned on S_I (token single reps) instead of C_L (atom conditioning).
+- Uses 128 attention keys with 2-4 spatial neighbors for sparse attention.
+- 18 blocks (vs. 3 for atom transformer) — this is the largest computation in each recycle.
 
+
+> **Pipeline:** Token Transformer outputs refined `A_I` (token features). These, along with atom-level features, feed into the Decoder.
 ---
 
-### CompactStreamingDecoder (Decoder, 3 blocks)
+### Step 5 — Atom Decoder (`CompactStreamingDecoder`, 3 blocks)
 
 The decoder wraps 3 `StructureLocalAtomTransformerBlock`s with cross-scale Upcast/Downcast layers. Each block refines atom features while incorporating token-level context.
 
@@ -614,7 +601,34 @@ Return (A_I, Q_L)
 | Token Transformer       | LocalTokenTransformer    | Encoder | 18     | AdaLN, Sparse Local Attention + Pair Bias (128 keys), SwiGLU MLP, Residual |
 | Atom Decoder            | CompactStreamingDecoder  | Decoder | 3      | Cross-Attn Upcast × 3, Atom Transformer Block × 3, Cross-Attn Downcast × 1 |
 
-All Atom Transformer and Token Transformer blocks — including the 3 blocks inside the decoder — share the same internal architecture (`StructureLocalAtomTransformerBlock`): **Local Attention with Pair Bias + Conditioned Transition (SwiGLU)**. The encoder (`LocalAtomTransformer`) runs these blocks directly on atom features, while the decoder (`CompactStreamingDecoder`) wraps them with cross-attention Upcast/Downcast layers to bridge token and atom scales. See the [Encoder vs Decoder section](#encoder-vs-decoder-same-block-different-architecture) above for details.
+All Atom Transformer and Token Transformer blocks — including the 3 blocks inside the decoder — share the same internal architecture (`StructureLocalAtomTransformerBlock`): **Local Attention with Pair Bias + Conditioned Transition (SwiGLU)**. The encoder (`LocalAtomTransformer`) runs these blocks directly on atom features, while the decoder (`CompactStreamingDecoder`) wraps them with cross-attention Upcast/Downcast layers to bridge token and atom scales. See the [Note: Encoder vs Decoder](#note-encoder-vs-decoder--same-block-different-architecture) below for details.
+
+> **Pipeline:** Decoder outputs updated `A_I` and `Q_L`. If more recycle iterations remain, these feed back to Step 2. Otherwise, proceed to prediction heads and denoising output.
+
+---
+
+### Note: Encoder vs Decoder — Same Block, Different Architecture
+
+The paper describes the encoder and decoder as using the **same Atom Transformer architecture**. In the code, however, they are implemented as two distinct classes:
+
+| Aspect | Encoder | Decoder |
+|--------|---------|--------|
+| **Class** | `LocalAtomTransformer` | `CompactStreamingDecoder` |
+| **Core block** | `StructureLocalAtomTransformerBlock` × 3 | `StructureLocalAtomTransformerBlock` × 3 |
+| **Upcast/Downcast** | None | Yes — cross-attention Upcast before each block, Downcast after all blocks |
+| **Input** | Atom-level only (`Q_L`, `C_L`, `P_LL`) | Token-level (`A_I`, `S_I`, `Z_II`) + Atom-level (`Q_L`, `C_L`, `P_LL`) |
+| **Output** | `Q_L` (atom features) | `(A_I, Q_L, offsets)` — both token and atom outputs |
+| **Dropout** | 0.0 | 0.10 |
+| **Scale bridging** | None — operates purely at atom level | Token ↔ Atom bridging via Upcast/Downcast |
+
+**Why are they different?**
+
+The paper says "same architecture" because both encoder and decoder use `StructureLocalAtomTransformerBlock` as their core repeating unit — identical local attention with pair bias + SwiGLU transition. However, the **decoder** sits after the Token Transformer, so it must fuse token-level predictions back into atom-level coordinates. This requires:
+
+- **Upcast** (before each block): Projects token-level features (`A_I`) down to atom-level via cross-attention, so the atom transformer block can incorporate token-level information.
+- **Downcast** (after all blocks): Pools atom-level features back up to token-level via cross-attention, producing updated token representations for the recycling loop.
+
+The **encoder**, by contrast, runs before any token-level processing and only needs to operate on atom-level features directly — no scale bridging needed.
 
 
 ## Step-by-Step Model Flow
