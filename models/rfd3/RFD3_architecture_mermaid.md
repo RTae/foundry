@@ -42,6 +42,7 @@ flowchart LR
 ---
 
 
+
 ## Atom Transformer and Token Transformer Sub-architecture
 
 The core of the recycling block is shown below, with encoder/decoder roles and block counts as in the paper:
@@ -56,21 +57,43 @@ flowchart LR
     ATOM2 -- Recycling --> ATOM1
 ```
 
-### Atom Transformer
-- **Role:** Encoder (first), Decoder (last)
-- **Blocks:** 3 per encoder/decoder
-- **Function:**
-    - Processes atomic-level features using local self-attention and feed-forward layers.
-    - Integrates information from both residue and atomic features.
-    - The first Atom Transformer encodes atomic context; the last Atom Transformer decodes and refines the output.
+### Block-by-Block Layer Breakdown
 
-### Token Transformer
-- **Role:** Encoder
-- **Blocks:** 18
-- **Function:**
-    - Processes token-level (residue-level) features using transformer layers.
-    - Captures long-range dependencies and context across the sequence.
-    - Aggregates and propagates information for downstream refinement.
+#### Feature Initializer (2 blocks, Encoder)
+- **Each block typically includes:**
+    - Linear projection layers to embed residue and atomic features into model space
+    - Layer normalization
+    - Nonlinear activation (e.g., ReLU or GELU)
+    - Optional dropout for regularization
+    - May include initial pairwise or positional encodings
+
+#### Atom Transformer (3 blocks, Encoder/Decoder)
+- **Each block typically includes:**
+    - Multi-head self-attention over atomic features (local or sparse attention)
+    - Feed-forward network (MLP) with nonlinear activation
+    - Layer normalization (pre- or post-attention/MLP)
+    - Residual connections around attention and MLP sublayers
+    - Optional dropout for regularization
+    - In the decoder role (last Atom Transformer), may include additional output heads or coordinate refinement layers
+
+#### Token Transformer (18 blocks, Encoder)
+- **Each block typically includes:**
+    - Multi-head self-attention over token (residue) features (can be global or local)
+    - Feed-forward network (MLP) with nonlinear activation
+    - Layer normalization (pre- or post-attention/MLP)
+    - Residual connections around attention and MLP sublayers
+    - Optional dropout for regularization
+    - May include cross-attention to atomic features or pairwise representations
+
+**Summary Table:**
+
+| Block                | Layers/Operations                                                                 |
+|----------------------|---------------------------------------------------------------------------------|
+| Feature Initializer  | Linear projection, LayerNorm, Activation, Dropout, Positional/Pairwise encoding  |
+| Atom Transformer     | Multi-head self-attention, MLP, LayerNorm, Residual, Dropout                     |
+| Token Transformer    | Multi-head self-attention, MLP, LayerNorm, Residual, Dropout, (optional cross-attention) |
+
+These blocks are stacked as shown in the diagram, with outputs from one block feeding into the next. The recycling loop enables repeated refinement, and the decoder Atom Transformer produces the final output for each recycle iteration.
 
 ---
 
