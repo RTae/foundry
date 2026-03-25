@@ -31,6 +31,19 @@ flowchart LR
         OUT2 -- "More denoising steps?" --> STEPIN
     end
     OUT2 --> FINAL[Output<br><i>Final structure, metadata</i>]
+
+    style IN fill:#e8f4fd,stroke:#2196F3,stroke-width:2px,color:#1565C0
+    style FI fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style STEPIN fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style TKINIT fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style ATOM1 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style TOKEN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style ATOM2 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style OUT1 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style OUT2 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style FINAL fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style DenoisingLoop fill:#fafafa,stroke:#616161,stroke-width:2px,stroke-dasharray:5 5
+    style RecycleLoop fill:#f5f5f5,stroke:#00BCD4,stroke-width:2px,stroke-dasharray:3 3
 ```
 
 **Diagram Notes:**
@@ -64,6 +77,14 @@ flowchart TD
         A2 --> A3
         A3 --> A4 --> A5 --> A6
     end
+
+    style A1 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style A2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style A3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style A4 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style A5 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style A6 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style FeatureInitializer fill:#fffde7,stroke:#FBC02D,stroke-width:2px
 ```
 
 - **Atom 1D Embedders:** Two embedding layers that project raw atomic features into model space.
@@ -90,6 +111,13 @@ flowchart TD
         B5[Residual Connection]
         B1 --> B2 --> B3 --> B4 --> B5
     end
+
+    style B1 fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    style B2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style B3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style B4 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style B5 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style AtomTransformerBlock fill:#e8f5e9,stroke:#388E3C,stroke-width:2px
 ```
 
 - **AdaLN / RMSNorm:** Normalizes input, optionally conditioned on single representations (AdaLN-Zero style).
@@ -115,6 +143,13 @@ flowchart TD
         C5[Residual Connection]
         C1 --> C2 --> C3 --> C4 --> C5
     end
+
+    style C1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style C2 fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style C3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style C4 fill:#ede7f6,stroke:#673AB7,stroke-width:2px,color:#311B92
+    style C5 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style TokenTransformerBlock fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
 ```
 
 - **AdaLN / RMSNorm:** Normalizes input, optionally conditioned on single representations.
@@ -141,6 +176,13 @@ flowchart TD
         D1 --> D5
         D2 --> D3 --> D4 --> D5
     end
+
+    style D1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
+    style D2 fill:#fce4ec,stroke:#E91E63,stroke-width:2px,color:#880E4F
+    style D3 fill:#fff3e0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    style D4 fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px,color:#6A1B9A
+    style D5 fill:#e8eaf6,stroke:#3F51B5,stroke-width:2px,color:#1A237E
+    style DiffusionTokenEncoder fill:#fafafa,stroke:#607D8B,stroke-width:2px
 ```
 
 - **Transition x2:** Two transition layers (RMSNorm + Linear + SiLU) to refine the single representation (S_I).
