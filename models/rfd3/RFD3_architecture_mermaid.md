@@ -42,22 +42,7 @@ flowchart LR
 ---
 
 
-
-## Atom Transformer and Token Transformer Sub-architecture
-
-The core of the recycling block is shown below, with encoder/decoder roles and block counts as in the paper:
-
-```mermaid
-flowchart LR
-    FEAT[Feature Initializer<br><i>2 blocks<br><b>Encoder</b></i>]
-    ATOM1[Atom Transformer<br><i>3 blocks<br><b>Encoder</b></i>]
-    TOKEN[Token Transformer<br><i>18 blocks<br><b>Encoder</b></i>]
-    ATOM2[Atom Transformer<br><i>3 blocks<br><b>Decoder</b></i>]
-    FEAT --> ATOM1 --> TOKEN --> ATOM2
-    ATOM2 -- Recycling --> ATOM1
-```
-
-### Block-by-Block Layer Breakdown
+## Block-by-Block Layer Breakdown
 
 #### Feature Initializer (2 blocks, Encoder)
 - **Each block typically includes:**
