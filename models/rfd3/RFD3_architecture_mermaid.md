@@ -594,7 +594,7 @@ Return (A_I, Q_L)
 ### Summary Table
 
 | Component               | Class                    | Role    | Blocks | Key Layers                                                                 |
-|-------------------------|--------------------------|---------|--------|---------------------------------------------------------------------------||
+|-------------------------|--------------------------|---------|--------|----------------------------------------------------------------------------|
 | Feature Initializer     | TokenInitializer         | Encoder | —      | 1D Embedders, Downcast, RelPos, 2 PairformerBlocks, Atom Pair MLP        |
 | Atom Encoder            | LocalAtomTransformer     | Encoder | 3      | AdaLN, Sparse Local Attention + Pair Bias, SwiGLU MLP, Residual          |
 | DiffusionTokenEncoder   | DiffusionTokenEncoder    | Encoder | —      | 2 Transitions, Distogram Embed, 2 Pair Transitions, 2 PairformerBlocks   |
