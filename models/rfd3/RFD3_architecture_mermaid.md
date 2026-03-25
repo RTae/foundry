@@ -67,9 +67,9 @@ The Feature Initializer prepares the model's internal representations from raw i
 
 ```mermaid
 flowchart LR
-    A["Atom & Token\nFeatures"] --> B["Embed\n(Linear x2)"] --> C["Downcast\n(Atom→Token)"] --> D["Pairwise Init\n(Outer Sum + RelPos)"] --> E["PairformerBlock\n× 2"] --> F["Atom Pair MLP"]
-    F --> OUT1["S_I, Z_II\n(token-level)"]
-    F --> OUT2["Q_L, C_L, P_LL\n(atom-level)"]
+    A["Input"] --> B["Embed\n(Linear x2)"] --> C["Downcast\n(Atom→Token)"] --> D["Pairwise Init\n(Outer Sum + RelPos)"] --> E["PairformerBlock\n× 2"] --> F["Atom Pair MLP"]
+    F --> OUT1["Token Output"]
+    F --> OUT2["Atom Output"]
 
     style A fill:#e8f4fd,stroke:#2196F3,stroke-width:2px,color:#1565C0
     style B fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
@@ -205,9 +205,9 @@ Each of the 3 blocks is a `StructureLocalAtomTransformerBlock`. The attention an
 
 ```mermaid
 flowchart LR
-    IN["Q_L\n(atom features)"] --> B1["Block 1\nAttn + SwiGLU"] --> B2["Block 2\nAttn + SwiGLU"] --> B3["Block 3\nAttn + SwiGLU"] --> OUT["Q_L\n(refined)"]
-    CL["C_L conditioning"] -.-> B1 & B2 & B3
-    PLL["P_LL pair bias"] -.-> B1 & B2 & B3
+    IN["Input"] --> B1["Block 1\nAttn + SwiGLU"] --> B2["Block 2\nAttn + SwiGLU"] --> B3["Block 3\nAttn + SwiGLU"] --> OUT["Output"]
+    CL["Conditioning"] -.-> B1 & B2 & B3
+    PLL["Pair Bias"] -.-> B1 & B2 & B3
 
     style IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
     style B1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
@@ -316,10 +316,10 @@ Sits between the Atom Encoder and Token Transformer. Conditions token and pair r
 
 ```mermaid
 flowchart LR
-    SI_IN["S_I"] --> T1["Transition × 2"] --> MIX
-    ZII_IN["Z_II"] --> DIST["+ Distogram\nEmbedding"] --> T2["Pair Transition × 2"] --> MIX["PairformerBlock\n× 2"]
-    MIX --> SI_OUT["S_I\n(conditioned)"]
-    MIX --> ZII_OUT["Z_II\n(conditioned)"]
+    SI_IN["Input"] --> T1["Transition × 2"] --> MIX
+    ZII_IN["Input"] --> DIST["+ Distogram\nEmbedding"] --> T2["Pair Transition × 2"] --> MIX["PairformerBlock\n× 2"]
+    MIX --> SI_OUT["Output"]
+    MIX --> ZII_OUT["Output"]
 
     style SI_IN fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
     style T1 fill:#e0f2f1,stroke:#009688,stroke-width:2px,color:#004D40
@@ -430,9 +430,9 @@ Uses the same `StructureLocalAtomTransformerBlock` as the Atom Transformer, but 
 
 ```mermaid
 flowchart LR
-    IN["A_I\n(token features)"] --> B1["Block 1"] --> B2["Block 2"] --> dots["..."] --> B18["Block 18"] --> OUT["A_I\n(refined)"]
-    SI["S_I conditioning"] -.-> B1 & B2 & B18
-    ZII["Z_II pair bias"] -.-> B1 & B2 & B18
+    IN["Input"] --> B1["Block 1\nAttn + SwiGLU"] --> B2["Block 2\nAttn + SwiGLU"] --> dots["..."] --> B18["Block 18\nAttn + SwiGLU"] --> OUT["Output"]
+    SI["Conditioning"] -.-> B1 & B2 & B18
+    ZII["Pair Bias"] -.-> B1 & B2 & B18
 
     style IN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style B1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
@@ -534,10 +534,10 @@ The decoder wraps 3 `StructureLocalAtomTransformerBlock`s with cross-scale Upcas
 
 ```mermaid
 flowchart LR
-    AI["A_I\n(token)"] --> UP1["Upcast\n(cross-attn)"] --> BLK1["Atom Block 1"] --> UP2["Upcast"] --> BLK2["Atom Block 2"] --> UP3["Upcast"] --> BLK3["Atom Block 3"] --> DC["Downcast\n(cross-attn)"]
-    QL["Q_L\n(atom)"] --> UP1
-    DC --> AI_OUT["A_I\n(updated)"]
-    BLK3 --> QL_OUT["Q_L\n(refined)"]
+    AI["Input"] --> UP1["Upcast\n(cross-attn)"] --> BLK1["Atom Block 1\nAttn + SwiGLU"] --> UP2["Upcast"] --> BLK2["Atom Block 2\nAttn + SwiGLU"] --> UP3["Upcast"] --> BLK3["Atom Block 3\nAttn + SwiGLU"] --> DC["Downcast\n(cross-attn)"]
+    QL["Input"] --> UP1
+    DC --> AI_OUT["Output"]
+    BLK3 --> QL_OUT["Output"]
 
     style AI fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style QL fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
