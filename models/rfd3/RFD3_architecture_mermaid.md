@@ -21,11 +21,11 @@ flowchart LR
             TOK[TokenEncoder<br><i>Token-level encoder</i>]
             TR[TokenTransformer<br><i>Token transformer</i>]
             DEC[Decoder<br><i>Refinement decoder</i>]
-            HD[Heads<br><i>Distogram, sequence, etc.</i>]
+            HD[Post Processing<br><i>Recycle output</i>]
             ENC --> TOK --> TR --> DEC --> HD
             HD -- "More recycle?" --> ENC
         end
-        HD --> OUT1[scale_positions_out<br><i>Post-processing</i>]
+        HD --> OUT1[Post-processing<br><i>Denoising output</i>]
         OUT1 --> OUT2[Step output<br><i>X_t-1, predictions</i>]
         OUT2 -- "More denoising steps?" --> STEPIN
     end
