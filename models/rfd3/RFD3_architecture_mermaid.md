@@ -396,9 +396,8 @@ flowchart TD
 flowchart LR
     subgraph BG [ ]
         direction LR
-        IN["Input"] --> B1["Block 1\n AdaLN -> Attn -> SwiGLU"] --> B2["Block 2\n AdaLN -> Attn -> SwiGLU"] --> B3["Block 3\nAdaLN -> Attn -> SwiGLU"] --> OUT["Output"]
-        CL["C_L \n(Condition)"] -.-> B1 & B2 & B3
-        PLL["P_LL \n(Pair Bias)"] -.-> B1 & B2 & B3
+        IN["Q_L\n(Atom Features)"] --> B1["Block 1\n AdaLN -> Attn -> SwiGLU"] --> B2["Block 2\n AdaLN -> Attn -> SwiGLU"] --> B3["Block 3\nAdaLN -> Attn -> SwiGLU"] --> OUT["Q_L\n(Refined)"]\n        CL["C_L \n(Atom Condition)"] -.-> B1 & B2 & B3
+        PLL["P_LL \n(Atom Pair Bias)"] -.-> B1 & B2 & B3
     end
 
     style IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
@@ -627,9 +626,9 @@ flowchart TD
 flowchart LR
     subgraph TG [ ]
         direction LR
-        IN["Input"] --> B1["Block 1\n AdaLN -> Attn -> SwiGLU"] --> B2["Block 2\n AdaLN -> Attn -> SwiGLU"] --> dots["..."] --> B18["Block 18\n AdaLN -> Attn -> SwiGLU"] --> OUT["Output"]
-        SI["C_L \n(Conditioning)"] -.-> B1 & B2 & B18
-        ZII["P_LL \n(Pair Bias)"] -.-> B1 & B2 & B18
+        IN["A_I\n(Token Features)"] --> B1["Block 1\n AdaLN -> Attn -> SwiGLU"] --> B2["Block 2\n AdaLN -> Attn -> SwiGLU"] --> dots["..."] --> B18["Block 18\n AdaLN -> Attn -> SwiGLU"] --> OUT["A_I\n(Refined)"]
+        SI["S_I \n(Token Condition)"] -.-> B1 & B2 & B18
+        ZII["Z_II \n(Token Pair Bias)"] -.-> B1 & B2 & B18
     end
 
     style IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
