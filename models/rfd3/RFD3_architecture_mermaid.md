@@ -165,24 +165,15 @@ The same core block is wrapped differently depending on context. The encoder cha
 
 ```mermaid
 flowchart LR
-    subgraph Encoder["Encoder (LocalAtomTransformer)"]
+    subgraph Encoder[" "]
         direction LR
-        E_IN["Q_L\n(atom features)"] --> EB1["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> EB2["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> EB3["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> E_OUT["Q_L\n(refined)"]
-        E_CL["C_L"] -.-> EB1 & EB2 & EB3
-        E_PLL["P_LL"] -.-> EB1 & EB2 & EB3
-    end
+        E_IN["Q_L\n(Atom Features)"] --> EB1["AdaLN -> Attn -> SwiGLU"]
+        EB1 --> EB2["AdaLN -> Attn -> SwiGLU"]
+        EB2 --> EB3["AdaLN -> Attn -> SwiGLU"]
+        EB3 --> E_OUT["Q_L\n(Refined Atoms)"]
 
-    subgraph Decoder["Decoder (CompactStreamingDecoder)"]
-        direction LR
-        D_AI["A_I\n(token features)"] -.-> U1
-        D_QL["Q_L\n(atom features)"] --> U1["Upcast\nRMSNorm → Linear\n(broadcast A_I → atoms)"] --> DB1["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> U2["Upcast\nRMSNorm → Linear\n(broadcast)"] --> DB2["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> U3["Upcast\nRMSNorm → Linear\n(broadcast)"] --> DB3["AdaLN → Attn\n+ Pair Bias\n→ SwiGLU"] --> DC["Downcast\nLinear → Mean Pool\n(atoms → token)"]
-        D_AI -.-> U2
-        D_AI -.-> U3
-        D_AI -.-> DC
-        D_CL["C_L"] -.-> DB1 & DB2 & DB3
-        D_PLL["P_LL"] -.-> DB1 & DB2 & DB3
-        DC --> D_AI_OUT["A_I\n(updated)"]
-        DB3 --> D_QL_OUT["Q_L\n(refined)"]
+        E_CL["C_L (Condition)"] -.-> EB1 & EB2 & EB3
+        E_PLL["P_LL (Pair Bias)"] -.-> EB1 & EB2 & EB3
     end
 
     style E_IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
@@ -192,6 +183,34 @@ flowchart LR
     style EB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style E_CL fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
     style E_PLL fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
+    style Encoder fill:#f9f9f9,stroke:#616161,stroke-width:2px
+```
+```mermaid
+flowchart LR
+    subgraph Decoder[" "]
+        direction LR
+        D_QL["Q_L\n(Atom Features)"] --> U1["Upcast\nRMSNorm -> Linear"]
+        D_AI["A_I\n(Token Features)"] -.-> U1
+        
+        U1 --> DB1["AdaLN -> Attn -> SwiGLU"]
+        DB1 --> U2["Upcast\nRMSNorm -> Linear"]
+        D_AI -.-> U2
+        
+        U2 --> DB2["AdaLN -> Attn -> SwiGLU"]
+        DB2 --> U3["Upcast\nRMSNorm -> Linear"]
+        D_AI -.-> U3
+        
+        U3 --> DB3["AdaLN -> Attn -> SwiGLU"]
+        DB3 --> DC["Downcast\nLinear -> Mean Pool"]
+        D_AI -.-> DC
+
+        D_CL["C_L (Condition)"] -.-> DB1 & DB2 & DB3
+        D_PLL["P_LL (Pair Bias)"] -.-> DB1 & DB2 & DB3
+        
+        DC --> D_AI_OUT["A_I\n(Updated Tokens)"]
+        DB3 --> D_QL_OUT["Q_L\n(Refined Atoms)"]
+    end
+
     style D_AI fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style D_QL fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
     style D_AI_OUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
@@ -205,6 +224,7 @@ flowchart LR
     style DB3 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style D_CL fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
     style D_PLL fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
+    style Decoder fill:#f5f5f5,stroke:#00BCD4,stroke-width:2px
 ```
 
 | | Encoder | Decoder |
@@ -605,18 +625,24 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    IN["Input"] --> B1["Block 1\nAttn + SwiGLU"] --> B2["Block 2\nAttn + SwiGLU"] --> dots["..."] --> B18["Block 18\nAttn + SwiGLU"] --> OUT["Output"]
-    SI["Conditioning"] -.-> B1 & B2 & B18
-    ZII["Pair Bias"] -.-> B1 & B2 & B18
+    subgraph TG [ ]
+        direction LR
+        IN["Input"] --> B1["Block 1\n AdaLN -> Attn -> SwiGLU"] --> B2["Block 2\n AdaLN -> Attn -> SwiGLU"] --> dots["..."] --> B18["Block 18\n AdaLN -> Attn -> SwiGLU"] --> OUT["Output"]
+        SI["C_L \n(Conditioning)"] -.-> B1 & B2 & B18
+        ZII["P_LL \n(Pair Bias)"] -.-> B1 & B2 & B18
+    end
 
-    style IN fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
     style B1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style B2 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
     style dots fill:#fafafa,stroke:#9E9E9E,stroke-width:1px,stroke-dasharray:3 3,color:#616161
     style B18 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
-    style OUT fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
+    style OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
     style SI fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
     style ZII fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
+
+    %% Background Style
+    style TG fill:#f9f9f9,stroke:#eeeeee,stroke-width:1px
 ```
 
 #### Detailed
