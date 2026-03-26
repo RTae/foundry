@@ -374,9 +374,12 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    IN["Input"] --> B1["Block 1\nAttn + SwiGLU"] --> B2["Block 2\nAttn + SwiGLU"] --> B3["Block 3\nAttn + SwiGLU"] --> OUT["Output"]
-    CL["Conditioning"] -.-> B1 & B2 & B3
-    PLL["Pair Bias"] -.-> B1 & B2 & B3
+    subgraph BG [ ]
+        direction LR
+        IN["Input"] --> B1["Block 1\n AdaLN -> Attn -> SwiGLU"] --> B2["Block 2\n AdaLN -> Attn -> SwiGLU"] --> B3["Block 3\nAdaLN -> Attn -> SwiGLU"] --> OUT["Output"]
+        CL["C_L \n(Condition)"] -.-> B1 & B2 & B3
+        PLL["P_LL \n(Pair Bias)"] -.-> B1 & B2 & B3
+    end
 
     style IN fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
     style B1 fill:#e3f2fd,stroke:#1976D2,stroke-width:2px,color:#0D47A1
