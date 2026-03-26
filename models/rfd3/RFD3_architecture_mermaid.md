@@ -388,6 +388,9 @@ flowchart LR
     style OUT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
     style CL fill:#fff3e0,stroke:#FF9800,stroke-width:1px,color:#E65100
     style PLL fill:#e8eaf6,stroke:#3F51B5,stroke-width:1px,color:#1A237E
+
+    %% Background Style
+    style BG fill:#f9f9f9,stroke:#eeeeee,stroke-width:1px
 ```
 
 Each block: **AdaLN → Sparse Local Attention (with pair bias) → Residual → AdaLN → SwiGLU MLP → Residual**
