@@ -159,6 +159,105 @@ flowchart TD
 
 Both sub-layers have **residual connections**.
 
+### Sparse Local Attention — Matrix View
+
+Instead of every atom attending to every other atom (full L×L matrix), each query attends only to **k=128 neighbors** selected by sequence locality (±2 tokens) and 3D Euclidean distance (k-NN).
+
+#### Full Attention Matrix (L×L) — every query attends to every key
+
+```
+         Key atoms →
+         1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 ...  L
+Q  1   [ █  █  █  █  █  █  █  █  █  █  █  █  █  █  █  ...  █ ]
+u  2   [ █  █  █  █  █  █  █  █  █  █  █  █  █  █  █  ...  █ ]
+e  3   [ █  █  █  █  █  █  █  █  █  █  █  █  █  █  █  ...  █ ]
+r  4   [ █  █  █  █  █  █  █  █  █  █  █  █  █  █  █  ...  █ ]
+y  5   [ █  █  █  █  █  █  █  █  █  █  █  █  █  █  █  ...  █ ]
+   6   [ █  █  █  █  █  █  █  █  █  █  █  █  █  █  █  ...  █ ]
+a  :   [ :  :  :  :  :  :  :  :  :  :  :  :  :  :  :  ···  : ]
+t  L   [ █  █  █  █  █  █  █  █  █  █  █  █  █  █  █  ...  █ ]
+o
+m      Memory: O(L²)    L=5000 → 25,000,000 entries → ~9.6 GB
+s
+```
+
+#### Sparse Attention Matrix (L×k) — each query attends to k=128 selected neighbors
+
+```
+         Key atoms →                                     3D k-NN
+         1  2  3  4  5  6  7  8  9  10 11 12 ... 47  ... 200 ... L
+Q  1   [ █  █  █  █  █  █  ·  ·  ·  ·  ·  ·     ·      █      · ]
+u  2   [ █  █  █  █  █  █  ·  ·  ·  ·  ·  ·     ·      ·      · ]
+e  3   [ █  █  █  █  █  █  █  ·  ·  ·  ·  ·     █      ·      · ]
+r  4   [ ·  █  █  █  █  █  █  █  ·  ·  ·  ·     ·      ·      █ ]
+y  5   [ ·  ·  █  █  █  █  █  █  █  ·  ·  ·     ·      █      · ]
+   6   [ ·  ·  ·  █  █  █  █  █  █  █  ·  ·     ·      ·      · ]
+a  :   [ ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·     ·      ·      · ]
+t  L   [ ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  █  █     ·      █      █ ]
+o       └──────────────────────────┘              └────────────────┘
+m        Sequence neighbors (±2 tokens)           3D nearest neighbors
+s        (guaranteed local chemical context)      (spatially close but
+                                                   sequence-distant contacts)
+         Memory: O(L×k)   L=5000, k=128 → 640,000 entries → ~245 MB
+                           ~39× reduction
+```
+
+#### How indices are built (two-phase fill)
+
+```
+For each query atom i:
+
+Phase 1 — Sequence neighbors (fill first):
+┌─────────────────────────────────────────────────────────────────────┐
+│  token[i-2]   token[i-1]   token[i]   token[i+1]   token[i+2]    │
+│  ┌───┬───┐   ┌───┬───┐   ┌───┬───┐   ┌───┬───┐   ┌───┬───┐      │
+│  │ a │ a │   │ a │ a │   │ a │ Q │   │ a │ a │   │ a │ a │      │
+│  └───┴───┘   └───┴───┘   └───┴───┘   └───┴───┘   └───┴───┘      │
+│  All atoms from ±2 tokens included (whole tokens, never partial)  │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ ~30-70 slots filled
+                                ▼
+Phase 2 — 3D k-NN fill (remaining slots):
+┌─────────────────────────────────────────────────────────────────────┐
+│  Compute Euclidean distances from X_L (3D coords)                  │
+│  D_LL = torch.cdist(X_L, X_L)     [B, L, L]                       │
+│                                                                     │
+│  Mask out already-selected sequence neighbors                       │
+│  Fill remaining (128 - seq_neighbors) slots with closest atoms      │
+│                                                                     │
+│  Result: indices[i] = [seq_neighbor_1, ..., 3d_nn_1, 3d_nn_2, ...] │
+│                        └── sorted ──────────────────── up to k=128 ┘│
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Gathered attention computation
+
+```
+Standard full attention:          Sparse gathered attention:
+
+Q  [B, H, L, d]                  Q      [B, H, L, d]      ← all queries
+K  [B, H, L, d]                  K_sp   [B, H, L, k, d]   ← gathered by indices
+V  [B, H, L, d]                  V_sp   [B, H, L, k, d]   ← gathered by indices
+B  [B, H, L, L]                  B_sp   [B, H, L, k]      ← gathered by indices
+
+scores = Q @ K^T                 scores = Q · K_sp^T
+       = [B, H, L, L]                   = [B, H, L, k]    ← k not L !
+
+attn = softmax(scores/√d + B)    attn = softmax(scores/√d + B_sp)
+     = [B, H, L, L]                   = [B, H, L, k]
+
+out  = attn @ V                  out  = attn · V_sp
+     = [B, H, L, d]                   = [B, H, L, d]      ← same output shape
+```
+
+| | Full Attention | Sparse Local Attention |
+|---|---|---|
+| **Matrix** | [L, L] — all pairs | [L, k] — k=128 neighbors per query |
+| **Memory** | O(L²) ≈ 9.6 GB | O(L×k) ≈ 245 MB (~39× smaller) |
+| **Softmax** | Over all L keys | Over k=128 neighbors only |
+| **Neighbors** | All atoms | Sequence ±2 tokens + 3D k-NN |
+| **K/V access** | Direct | Gathered via sparse indices |
+
 ### Encoder vs Decoder Wrapping
 
 The same core block is wrapped differently depending on context. The encoder chains blocks directly; the decoder adds **Upcast** (token → atom) before each block and a final **Downcast** (atom → token):
