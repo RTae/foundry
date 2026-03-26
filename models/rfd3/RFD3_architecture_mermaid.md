@@ -396,7 +396,8 @@ flowchart TD
 flowchart LR
     subgraph BG [ ]
         direction LR
-        IN["Q_L\n(Atom Features)"] --> B1["Block 1\n AdaLN -> Attn -> SwiGLU"] --> B2["Block 2\n AdaLN -> Attn -> SwiGLU"] --> B3["Block 3\nAdaLN -> Attn -> SwiGLU"] --> OUT["Q_L\n(Refined)"]\n        CL["C_L \n(Atom Condition)"] -.-> B1 & B2 & B3
+        IN["Q_L\n(Atom Features)"] --> B1["Block 1\n AdaLN -> Attn -> SwiGLU"] --> B2["Block 2\n AdaLN -> Attn -> SwiGLU"] --> B3["Block 3\nAdaLN -> Attn -> SwiGLU"] --> OUT["Q_L\n(Refined)"]
+        CL["C_L \n(Atom Condition)"] -.-> B1 & B2 & B3
         PLL["P_LL \n(Atom Pair Bias)"] -.-> B1 & B2 & B3
     end
 
