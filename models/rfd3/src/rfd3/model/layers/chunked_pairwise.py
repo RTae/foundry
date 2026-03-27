@@ -223,6 +223,204 @@ class ChunkedPairwiseEmbedder:
             self._sm_cached = self.process_single_m(C_L)  # [L, c_atompair]
             self._Z_proc_cached = self.process_z(Z_init_II)  # [I, I, c_atompair]
 
+    def _forward_chunked_vectorized(
+        self,
+        f: dict,
+        indices: torch.Tensor,
+        C_L: torch.Tensor,
+        Z_init_II: torch.Tensor,
+        tok_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorized implementation — no Python-level loops over atoms."""
+        with trace_range("RFD3/Memory/ChunkedPairwise/ForwardChunkedVectorized"):
+            B, L, k = indices.shape
+            device = indices.device
+
+            # Initialize sparse P_LL
+            P_LL_sparse = torch.zeros(
+                B, L, k, self.c_atompair, device=device, dtype=C_L.dtype
+            )
+
+            # Handle both batched and non-batched C_L
+            if C_L.dim() == 2:  # [L, c_token] - add batch dimension
+                C_L = C_L.unsqueeze(0)  # [1, L, c_token]
+            # Add bounds checking to prevent index errors
+            L_max = C_L.shape[1]
+            valid_indices = torch.clamp(
+                indices, 0, L_max - 1
+            )  # Clamp indices to valid range
+
+            # Ensure indices have the right shape for gathering
+            if valid_indices.dim() == 2:  # [L, k] - add batch dimension
+                valid_indices = valid_indices.unsqueeze(0).expand(
+                    C_L.shape[0], -1, -1
+                )  # [B, L, k]
+
+            with trace_range("RFD3/Memory/ChunkedPairwise/MotifEmbedding"):
+                # 1. Motif position embedding — fully vectorized over [B, L, k]
+                if self.motif_pos_embedder is not None and "motif_pos" in f:
+                    motif_pos = f["motif_pos"]  # [L, 3]
+                    is_motif = f["is_motif_atom_with_fixed_coord"]  # [L]
+
+                    # Gather all key positions at once — [B, L, k, 3]
+                    key_pos_all = motif_pos[valid_indices]
+                    # All query positions — [B, L, 3]
+                    query_pos_all = motif_pos.unsqueeze(0).expand(B, L, 3)
+                    # Pairwise displacement — [B, L, k, 3]
+                    D_pairs_all = query_pos_all.unsqueeze(2) - key_pos_all
+
+                    # Valid mask: keys must be motif — [B, L, k, 1]
+                    key_is_motif_all = is_motif[valid_indices].unsqueeze(-1).float()
+
+                    # Inline sinusoidal distance embedding over [B, L, k]
+                    dist_all = torch.linalg.norm(D_pairs_all, dim=-1)  # [B, L, k]
+                    half_dim = self.motif_pos_embedder.n_freqs
+                    freq = torch.exp(
+                        -math.log(10000.0)
+                        * torch.arange(0, half_dim, dtype=torch.float32, device=device)
+                        / half_dim
+                    )  # [n_freqs]
+                    angles = dist_all.unsqueeze(-1) * freq  # [B, L, k, n_freqs]
+                    sincos = torch.cat(
+                        [torch.sin(angles), torch.cos(angles)], dim=-1
+                    )  # [B, L, k, 2*n_freqs]
+                    motif_pairs = self.motif_pos_embedder.output_proj(sincos)  # [B, L, k, c_atompair]
+                    motif_pairs = motif_pairs * key_is_motif_all
+                    motif_pairs = (
+                        motif_pairs
+                        + self.motif_pos_embedder.process_valid_mask(
+                            key_is_motif_all.to(motif_pairs.dtype)
+                        )
+                        * key_is_motif_all
+                    )
+
+                    # Mask out non-motif query atoms
+                    query_is_motif = is_motif.view(1, L, 1, 1).float()
+                    motif_pairs = motif_pairs * query_is_motif
+
+                    P_LL_sparse += motif_pairs
+
+            with trace_range("RFD3/Memory/ChunkedPairwise/ReferenceEmbedding"):
+                # 2. Reference position embedding — fully vectorized over [B, L, k]
+                if self.ref_pos_embedder is not None and "ref_pos" in f:
+                    ref_pos = f["ref_pos"]  # [L, 3]
+                    ref_space_uid = f["ref_space_uid"]  # [L]
+                    is_motif_seq = f["is_motif_atom_with_fixed_seq"]  # [L]
+
+                    # Gather all key positions at once — [B, L, k, 3]
+                    key_pos_all = ref_pos[valid_indices]
+                    # All query positions — [B, L, 3]
+                    query_pos_all = ref_pos.unsqueeze(0).expand(B, L, 3)
+                    # Pairwise displacement — [B, L, k, 3]
+                    D_pairs_all = query_pos_all.unsqueeze(2) - key_pos_all
+
+                    # Valid mask: same ref_space_uid AND key is motif_seq — [B, L, k, 1]
+                    key_space_uid = ref_space_uid[valid_indices]  # [B, L, k]
+                    query_space_uid = ref_space_uid.view(1, L, 1).expand(B, L, k)  # [B, L, k]
+                    key_is_motif_seq = is_motif_seq[valid_indices]  # [B, L, k]
+                    same_token = key_space_uid == query_space_uid  # [B, L, k]
+                    valid_mask_all = (
+                        (same_token & key_is_motif_seq).unsqueeze(-1).float()
+                    )  # [B, L, k, 1]
+
+                    # Inline position pair distance embedding over [B, L, k]
+                    if self.ref_pos_embedder.embed_frame:
+                        ref_pairs = self.ref_pos_embedder.process_d(D_pairs_all) * valid_mask_all
+                        norm_sq = torch.linalg.norm(D_pairs_all, dim=-1, keepdim=True) ** 2
+                        inv_dist = 1 / (1 + norm_sq)
+                        ref_pairs = (
+                            ref_pairs
+                            + self.ref_pos_embedder.process_inverse_dist(inv_dist)
+                            * valid_mask_all
+                        )
+                        ref_pairs = (
+                            ref_pairs
+                            + self.ref_pos_embedder.process_valid_mask(
+                                valid_mask_all.to(ref_pairs.dtype)
+                            )
+                            * valid_mask_all
+                        )
+                    else:
+                        norm_sq = torch.linalg.norm(D_pairs_all, dim=-1, keepdim=True) ** 2
+                        norm_sq = torch.clamp(norm_sq, min=1e-6)
+                        inv_dist = 1 / (1 + norm_sq)
+                        ref_pairs = (
+                            self.ref_pos_embedder.process_inverse_dist(inv_dist)
+                            * valid_mask_all
+                        )
+                        ref_pairs = (
+                            ref_pairs
+                            + self.ref_pos_embedder.process_valid_mask(
+                                valid_mask_all.to(ref_pairs.dtype)
+                            )
+                            * valid_mask_all
+                        )
+
+                    # Mask out non-motif_seq query atoms
+                    query_is_motif_seq = is_motif_seq.view(1, L, 1, 1).float()
+                    ref_pairs = ref_pairs * query_is_motif_seq
+
+                    P_LL_sparse += ref_pairs
+
+            with trace_range("RFD3/Memory/ChunkedPairwise/SingleFeatureTerms"):
+                # 3. Single embedding terms
+                if self._sl_cached is not None:
+                    # Fast path: MLP already run at tokenisation — just index into the result.
+                    # sl_cached [L, c_atompair]: query atom l always maps to row l.
+                    single_l = self._sl_cached.unsqueeze(0).unsqueeze(2).expand(B, -1, k, -1)
+                    # sm_cached [L, c_atompair]: key atoms are given by valid_indices [B, L, k].
+                    single_m = self._sm_cached[valid_indices]  # [B, L, k, c_atompair]
+                else:
+                    # Slow path (no cache): run the MLPs over the raw atom features.
+                    if C_L.shape[0] != B:
+                        C_L = C_L.expand(B, -1, -1)  # [B, L, c_token]
+                    C_L_queries = C_L.unsqueeze(2).expand(-1, -1, k, -1)  # [B, L, k, c_token]
+                    C_L_keys = torch.gather(
+                        C_L_queries,
+                        1,
+                        valid_indices.unsqueeze(-1).expand(-1, -1, -1, C_L.shape[-1]),
+                    )  # [B, L, k, c_token]
+                    single_l = self.process_single_l(C_L_queries)  # [B, L, k, c_atompair]
+                    single_m = self.process_single_m(C_L_keys)  # [B, L, k, c_atompair]
+                P_LL_sparse += single_l + single_m
+
+            with trace_range("RFD3/Memory/ChunkedPairwise/TokenPairTerms"):
+                # 4. Token pair features Z_init_II
+                # Map atoms to tokens and gather token pair features.
+                if tok_idx.dim() == 1:  # [L] - add batch dimension for consistency
+                    tok_idx_expanded = tok_idx.unsqueeze(0)  # [1, L]
+                else:
+                    tok_idx_expanded = tok_idx
+
+                if tok_idx_expanded.shape[0] != B:
+                    tok_idx_expanded = tok_idx_expanded.expand(B, -1)  # [B, L]
+                tok_queries = tok_idx_expanded.unsqueeze(2).expand(-1, -1, k)  # [B, L, k]
+                tok_keys = torch.gather(tok_queries, 1, valid_indices)  # [B, L, k]
+
+                if self._Z_proc_cached is not None:
+                    # Fast path: process_z already run at tokenisation.
+                    Z_processed = self._Z_proc_cached  # [I, I, c_atompair]
+                else:
+                    # Slow path: run the MLP over the token-pair matrix.
+                    Z_processed = self.process_z(Z_init_II)  # [I, I, c_atompair]
+
+                I_z, I_z2 = Z_processed.shape[:2]
+                Z_pairs_processed = torch.zeros(
+                    B, L, k, self.c_atompair, device=device, dtype=Z_processed.dtype
+                )
+                for b in range(B):
+                    tq = torch.clamp(tok_queries[b], 0, I_z - 1)  # [L, k]
+                    tk = torch.clamp(tok_keys[b], 0, I_z2 - 1)  # [L, k]
+                    Z_pairs_processed[b] = Z_processed[tq, tk]  # [L, k, c_atompair]
+
+                P_LL_sparse += Z_pairs_processed
+
+            with trace_range("RFD3/Memory/ChunkedPairwise/FinalPairMLP"):
+                # 5. Final MLP - ADD the result, don't replace (to match standard implementation)
+                P_LL_sparse = P_LL_sparse + self.pair_mlp(P_LL_sparse)
+
+            return P_LL_sparse.contiguous()
+
     def forward_chunked(
         self,
         f: dict,
@@ -230,6 +428,7 @@ class ChunkedPairwiseEmbedder:
         C_L: torch.Tensor,  # [L, c_token] or [B, L, c_token] - atom features
         Z_init_II: torch.Tensor,  # [I, I, c_z] - token pair features
         tok_idx: torch.Tensor,  # [L] - atom to token mapping
+        use_loop: bool = True,
     ) -> torch.Tensor:
         """
         Compute P_LL only for the pairs specified by attention indices.
@@ -245,10 +444,15 @@ class ChunkedPairwiseEmbedder:
             C_L:       Atom-level features [L, c_token] or [B, L, c_token]
             Z_init_II: Token-level pair features [I, I, c_z]
             tok_idx:   Atom-to-token mapping [L]
+            use_loop:  If True (default), use original looped implementation.
+                       If False, use vectorized implementation.
 
         Returns:
             P_LL_sparse: Sparse pairwise features [B, L, k, c_atompair]
         """
+        if not use_loop:
+            return self._forward_chunked_vectorized(f, indices, C_L, Z_init_II, tok_idx)
+
         with trace_range("RFD3/Memory/ChunkedPairwise/ForwardChunked"):
             B, L, k = indices.shape
             device = indices.device
@@ -400,3 +604,113 @@ def create_chunked_embedders(
         motif_pos_embedder=motif_pos_embedder,
         ref_pos_embedder=ref_pos_embedder,
     )
+
+
+def test_forward_chunked_correctness():
+    """
+    Runs old looped version and new vectorized version on identical random
+    inputs and asserts max absolute difference < 1e-5.
+    Prints: PASS or FAIL with the actual max diff value.
+    """
+    import torch
+
+    import time
+
+    torch.manual_seed(42)
+    B, L, k, c = 1, 256, 32, 16
+    I = 8  # number of tokens
+    c_token = 128
+    c_z = 128
+    device = "cpu"
+
+    # Build embedder via factory (creates fresh random weights)
+    embedder = create_chunked_embedders(c_atompair=c, embed_frame=True)
+
+    # Build dummy inputs
+    indices = torch.randint(0, L, (B, L, k), device=device)
+    C_L = torch.randn(L, c_token, device=device)
+    Z_init_II = torch.randn(I, I, c_z, device=device)
+    tok_idx = torch.randint(0, I, (L,), device=device)
+
+    # ~40% of atoms are motif
+    is_motif = torch.zeros(L, dtype=torch.bool, device=device)
+    is_motif[torch.randperm(L)[: L // 3]] = True
+    is_motif_seq = torch.zeros(L, dtype=torch.bool, device=device)
+    is_motif_seq[torch.randperm(L)[: L // 3]] = True
+
+    f = {
+        "motif_pos": torch.randn(L, 3, device=device),
+        "ref_pos": torch.randn(L, 3, device=device),
+        "is_motif_atom_with_fixed_coord": is_motif,
+        "is_motif_atom_with_fixed_seq": is_motif_seq,
+        "ref_space_uid": tok_idx.clone(),  # reuse tok_idx as space uid for simplicity
+    }
+
+    # --- Correctness check ---
+    with torch.no_grad():
+        out_loop = embedder.forward_chunked(
+            f, indices, C_L, Z_init_II, tok_idx, use_loop=True
+        )
+        out_vec = embedder.forward_chunked(
+            f, indices, C_L, Z_init_II, tok_idx, use_loop=False
+        )
+
+    max_diff = (out_loop - out_vec).abs().max().item()
+    if max_diff < 1e-5:
+        print(f"PASS — max abs diff = {max_diff:.2e}")
+    else:
+        print(f"FAIL — max abs diff = {max_diff:.2e}")
+        diff = (out_loop - out_vec).abs()
+        flat_idx = diff.argmax()
+        coords = []
+        for dim_size in reversed(diff.shape):
+            coords.append(flat_idx % dim_size)
+            flat_idx = flat_idx // dim_size
+        coords.reverse()
+        print(f"  worst at index {[c.item() for c in coords]}")
+        print(f"  looped  = {out_loop.flatten()[diff.argmax()].item():.6f}")
+        print(f"  vector  = {out_vec.flatten()[diff.argmax()].item():.6f}")
+
+    assert max_diff < 1e-5, f"Outputs differ by {max_diff:.2e}"
+
+    # --- Speed benchmark ---
+    def _bench(embed, feat, idx, cl, zii, ti, use_loop, n_warmup=3, n_iters=20):
+        with torch.no_grad():
+            for _ in range(n_warmup):
+                embed.forward_chunked(feat, idx, cl, zii, ti, use_loop=use_loop)
+            t0 = time.perf_counter()
+            for _ in range(n_iters):
+                embed.forward_chunked(feat, idx, cl, zii, ti, use_loop=use_loop)
+        return (time.perf_counter() - t0) / n_iters
+
+    for bench_L in [L, 2048]:
+        # rebuild inputs at bench_L size
+        torch.manual_seed(42)
+        b_indices = torch.randint(0, bench_L, (B, bench_L, k), device=device)
+        b_C_L = torch.randn(bench_L, c_token, device=device)
+        b_tok_idx = torch.randint(0, I, (bench_L,), device=device)
+        b_is_motif = torch.zeros(bench_L, dtype=torch.bool, device=device)
+        b_is_motif[torch.randperm(bench_L)[: bench_L // 3]] = True
+        b_is_motif_seq = torch.zeros(bench_L, dtype=torch.bool, device=device)
+        b_is_motif_seq[torch.randperm(bench_L)[: bench_L // 3]] = True
+        b_f = {
+            "motif_pos": torch.randn(bench_L, 3, device=device),
+            "ref_pos": torch.randn(bench_L, 3, device=device),
+            "is_motif_atom_with_fixed_coord": b_is_motif,
+            "is_motif_atom_with_fixed_seq": b_is_motif_seq,
+            "ref_space_uid": b_tok_idx.clone(),
+        }
+        n_w, n_i = (2, 5) if bench_L >= 2048 else (3, 20)
+        t_loop = _bench(embedder, b_f, b_indices, b_C_L, Z_init_II, b_tok_idx, True, n_w, n_i)
+        t_vec = _bench(embedder, b_f, b_indices, b_C_L, Z_init_II, b_tok_idx, False, n_w, n_i)
+        speedup = t_loop / t_vec if t_vec > 0 else float("inf")
+        print(f"\n[L={bench_L}]")
+        print(f"  Looped:     {t_loop*1000:.2f} ms")
+        print(f"  Vectorized: {t_vec*1000:.2f} ms")
+        print(f"  Speedup:    {speedup:.1f}x")
+
+    return max_diff
+
+
+if __name__ == "__main__":
+    test_forward_chunked_correctness()
