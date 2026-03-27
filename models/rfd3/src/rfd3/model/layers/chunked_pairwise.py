@@ -6,6 +6,7 @@ only the pairs needed for sparse attention, reducing memory usage from O(L²) to
 """
 
 import math
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -13,6 +14,132 @@ import torch.nn as nn
 from rfd3.model.layers.blocks import PositionPairDistEmbedder, SinusoidalDistEmbed
 from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
 from rfd3.utils.tracing import trace_range
+
+
+def _chunked_pairwise_compute(
+    indices: torch.Tensor,          # [B, L, k]
+    C_L: torch.Tensor,              # [B, L, c_token] (already batched)
+    c_atompair: int,
+    # Motif inputs (may be zero-length dummies if no motif)
+    motif_pos: torch.Tensor,        # [L, 3]
+    is_motif: torch.Tensor,         # [L] bool
+    has_motif: bool,
+    motif_output_proj_weight: torch.Tensor,   # [2*n_freqs, c_atompair]
+    motif_valid_mask_weight: torch.Tensor,    # [1, c_atompair]
+    motif_n_freqs: int,
+    # Ref inputs (may be zero-length dummies if no ref)
+    ref_pos: torch.Tensor,          # [L, 3]
+    ref_space_uid: torch.Tensor,    # [L]
+    is_motif_seq: torch.Tensor,     # [L] bool
+    has_ref: bool,
+    ref_embed_frame: bool,
+    ref_process_d_weight: torch.Tensor,       # [3, c_atompair]
+    ref_inv_dist_weight: torch.Tensor,        # [1, c_atompair]
+    ref_valid_mask_weight: torch.Tensor,      # [1, c_atompair]
+    # Single feature inputs
+    sl_cached: Optional[torch.Tensor],        # [L, c_atompair] or None
+    sm_cached: Optional[torch.Tensor],        # [L, c_atompair] or None
+    # Token pair inputs
+    tok_idx: torch.Tensor,          # [L]
+    Z_processed: torch.Tensor,      # [I, I, c_atompair]
+) -> torch.Tensor:
+    """
+    Pure-tensor compute core for chunked pairwise embedding.
+    No Python-level loops, no context managers — fully compilable by torch.compile.
+    """
+    B, L, k = indices.shape
+    device = indices.device
+    dtype = C_L.dtype
+
+    L_max = C_L.shape[1]
+    valid_indices = torch.clamp(indices, 0, L_max - 1)
+
+    P_LL_sparse = torch.zeros(B, L, k, c_atompair, device=device, dtype=dtype)
+
+    # --- 1. Motif sinusoidal embedding ---
+    if has_motif:
+        key_pos_all = motif_pos[valid_indices]                          # [B, L, k, 3]
+        query_pos_all = motif_pos.unsqueeze(0).expand(B, L, 3)
+        D_pairs_all = query_pos_all.unsqueeze(2) - key_pos_all          # [B, L, k, 3]
+        key_is_motif_all = is_motif[valid_indices].unsqueeze(-1).float() # [B, L, k, 1]
+
+        dist_all = torch.linalg.norm(D_pairs_all, dim=-1)               # [B, L, k]
+        freq = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(0, motif_n_freqs, dtype=torch.float32, device=device)
+            / motif_n_freqs
+        )
+        angles = dist_all.unsqueeze(-1) * freq                          # [B, L, k, n_freqs]
+        sincos = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        # Linear projection via matmul (output_proj is linearNoBias)
+        motif_pairs = torch.matmul(sincos, motif_output_proj_weight)     # [B, L, k, c_atompair]
+        motif_pairs = motif_pairs * key_is_motif_all
+        motif_pairs = (
+            motif_pairs
+            + torch.matmul(key_is_motif_all, motif_valid_mask_weight) * key_is_motif_all
+        )
+        query_is_motif = is_motif.view(1, L, 1, 1).float()
+        P_LL_sparse = P_LL_sparse + motif_pairs * query_is_motif
+
+    # --- 2. Reference position pair dist embedding ---
+    if has_ref:
+        key_pos_all = ref_pos[valid_indices]                             # [B, L, k, 3]
+        query_pos_all = ref_pos.unsqueeze(0).expand(B, L, 3)
+        D_pairs_all = query_pos_all.unsqueeze(2) - key_pos_all           # [B, L, k, 3]
+
+        key_space_uid = ref_space_uid[valid_indices]
+        query_space_uid = ref_space_uid.view(1, L, 1).expand(B, L, k)
+        key_is_motif_seq = is_motif_seq[valid_indices]
+        same_token = key_space_uid == query_space_uid
+        valid_mask_all = (same_token & key_is_motif_seq).unsqueeze(-1).float()
+
+        if ref_embed_frame:
+            ref_pairs = torch.matmul(D_pairs_all, ref_process_d_weight) * valid_mask_all
+            norm_sq = torch.linalg.norm(D_pairs_all, dim=-1, keepdim=True) ** 2
+            inv_dist = 1 / (1 + norm_sq)
+            ref_pairs = ref_pairs + torch.matmul(inv_dist, ref_inv_dist_weight) * valid_mask_all
+            ref_pairs = (
+                ref_pairs
+                + torch.matmul(valid_mask_all, ref_valid_mask_weight) * valid_mask_all
+            )
+        else:
+            norm_sq = torch.linalg.norm(D_pairs_all, dim=-1, keepdim=True) ** 2
+            norm_sq = torch.clamp(norm_sq, min=1e-6)
+            inv_dist = 1 / (1 + norm_sq)
+            ref_pairs = torch.matmul(inv_dist, ref_inv_dist_weight) * valid_mask_all
+            ref_pairs = (
+                ref_pairs
+                + torch.matmul(valid_mask_all, ref_valid_mask_weight) * valid_mask_all
+            )
+
+        query_is_motif_seq = is_motif_seq.view(1, L, 1, 1).float()
+        P_LL_sparse = P_LL_sparse + ref_pairs * query_is_motif_seq
+
+    # --- 3. Single feature terms (cached path only) ---
+    if sl_cached is not None and sm_cached is not None:
+        single_l = sl_cached.unsqueeze(0).unsqueeze(2).expand(B, -1, k, -1)
+        single_m = sm_cached[valid_indices]
+        P_LL_sparse = P_LL_sparse + single_l + single_m
+
+    # --- 4. Token pair features ---
+    tok_idx_expanded = tok_idx.unsqueeze(0).expand(B, L)
+    tok_queries = tok_idx_expanded.unsqueeze(2).expand(-1, -1, k)
+    tok_keys = torch.gather(tok_queries, 1, valid_indices)
+    I_z = Z_processed.shape[0]
+    I_z2 = Z_processed.shape[1]
+    tq = torch.clamp(tok_queries, 0, I_z - 1)
+    tk = torch.clamp(tok_keys, 0, I_z2 - 1)
+    # Flatten for single advanced-index gather (avoids loop over B)
+    Z_pairs = Z_processed[tq.reshape(-1), tk.reshape(-1)].reshape(B, L, k, c_atompair)
+    P_LL_sparse = P_LL_sparse + Z_pairs
+
+    return P_LL_sparse
+
+
+@lru_cache(maxsize=1)
+def _get_compiled_compute():
+    """Lazily compile the compute function on first use."""
+    return torch.compile(_chunked_pairwise_compute, dynamic=True)
 
 
 class ChunkedPositionPairDistEmbedder:
@@ -223,7 +350,7 @@ class ChunkedPairwiseEmbedder:
             self._sm_cached = self.process_single_m(C_L)  # [L, c_atompair]
             self._Z_proc_cached = self.process_z(Z_init_II)  # [I, I, c_atompair]
 
-    def _forward_chunked_vectorized(
+    def _forward_chunked_compiled(
         self,
         f: dict,
         indices: torch.Tensor,
@@ -231,192 +358,73 @@ class ChunkedPairwiseEmbedder:
         Z_init_II: torch.Tensor,
         tok_idx: torch.Tensor,
     ) -> torch.Tensor:
-        """Vectorized implementation — no Python-level loops over atoms."""
-        with trace_range("RFD3/Memory/ChunkedPairwise/ForwardChunkedVectorized"):
+        """Compiled implementation — vectorized ops fused via torch.compile."""
+        with trace_range("RFD3/Memory/ChunkedPairwise/ForwardChunkedCompiled"):
+            # --- Prepare inputs ---
+            if C_L.dim() == 2:
+                C_L = C_L.unsqueeze(0)
+
+            has_motif = self.motif_pos_embedder is not None and "motif_pos" in f
+            has_ref = self.ref_pos_embedder is not None and "ref_pos" in f
             B, L, k = indices.shape
             device = indices.device
+            dummy3 = torch.zeros(1, 3, device=device, dtype=C_L.dtype)
+            dummy1 = torch.zeros(1, dtype=torch.bool, device=device)
 
-            # Initialize sparse P_LL
-            P_LL_sparse = torch.zeros(
-                B, L, k, self.c_atompair, device=device, dtype=C_L.dtype
+            # Motif args
+            motif_pos = f.get("motif_pos", dummy3) if has_motif else dummy3
+            is_motif = f.get("is_motif_atom_with_fixed_coord", dummy1) if has_motif else dummy1
+            if has_motif:
+                motif_out_w = self.motif_pos_embedder.output_proj.weight.t()       # [2*n_freqs, c_atompair]
+                motif_vm_w = self.motif_pos_embedder.process_valid_mask.weight.t()  # [1, c_atompair]
+                motif_n_freqs = self.motif_pos_embedder.n_freqs
+            else:
+                motif_out_w = torch.zeros(1, self.c_atompair, device=device, dtype=C_L.dtype)
+                motif_vm_w = torch.zeros(1, self.c_atompair, device=device, dtype=C_L.dtype)
+                motif_n_freqs = 1
+
+            # Ref args
+            ref_pos = f.get("ref_pos", dummy3) if has_ref else dummy3
+            ref_space_uid = f.get("ref_space_uid", dummy1.long()) if has_ref else dummy1.long()
+            is_motif_seq = f.get("is_motif_atom_with_fixed_seq", dummy1) if has_ref else dummy1
+            if has_ref:
+                ref_embed_frame = self.ref_pos_embedder.embed_frame
+                ref_d_w = self.ref_pos_embedder.process_d.weight.t() if ref_embed_frame else torch.zeros(3, self.c_atompair, device=device, dtype=C_L.dtype)
+                ref_inv_w = self.ref_pos_embedder.process_inverse_dist.weight.t()
+                ref_vm_w = self.ref_pos_embedder.process_valid_mask.weight.t()
+            else:
+                ref_embed_frame = True
+                ref_d_w = torch.zeros(3, self.c_atompair, device=device, dtype=C_L.dtype)
+                ref_inv_w = torch.zeros(1, self.c_atompair, device=device, dtype=C_L.dtype)
+                ref_vm_w = torch.zeros(1, self.c_atompair, device=device, dtype=C_L.dtype)
+
+            # Single feature terms — ensure they're always populated
+            if self._sl_cached is not None:
+                sl_cached = self._sl_cached
+                sm_cached = self._sm_cached
+            else:
+                sl_cached = self.process_single_l(C_L.squeeze(0))   # [L, c_atompair]
+                sm_cached = self.process_single_m(C_L.squeeze(0))   # [L, c_atompair]
+
+            # Token pair features
+            if self._Z_proc_cached is not None:
+                Z_processed = self._Z_proc_cached
+            else:
+                Z_processed = self.process_z(Z_init_II)
+
+            # --- Call core compute ---
+            P_LL_sparse = _get_compiled_compute()(
+                indices, C_L, self.c_atompair,
+                motif_pos, is_motif, has_motif,
+                motif_out_w, motif_vm_w, motif_n_freqs,
+                ref_pos, ref_space_uid, is_motif_seq, has_ref,
+                ref_embed_frame, ref_d_w, ref_inv_w, ref_vm_w,
+                sl_cached, sm_cached,
+                tok_idx, Z_processed,
             )
 
-            # Handle both batched and non-batched C_L
-            if C_L.dim() == 2:  # [L, c_token] - add batch dimension
-                C_L = C_L.unsqueeze(0)  # [1, L, c_token]
-            # Add bounds checking to prevent index errors
-            L_max = C_L.shape[1]
-            valid_indices = torch.clamp(
-                indices, 0, L_max - 1
-            )  # Clamp indices to valid range
-
-            # Ensure indices have the right shape for gathering
-            if valid_indices.dim() == 2:  # [L, k] - add batch dimension
-                valid_indices = valid_indices.unsqueeze(0).expand(
-                    C_L.shape[0], -1, -1
-                )  # [B, L, k]
-
-            with trace_range("RFD3/Memory/ChunkedPairwise/MotifEmbedding"):
-                # 1. Motif position embedding — fully vectorized over [B, L, k]
-                if self.motif_pos_embedder is not None and "motif_pos" in f:
-                    motif_pos = f["motif_pos"]  # [L, 3]
-                    is_motif = f["is_motif_atom_with_fixed_coord"]  # [L]
-
-                    # Gather all key positions at once — [B, L, k, 3]
-                    key_pos_all = motif_pos[valid_indices]
-                    # All query positions — [B, L, 3]
-                    query_pos_all = motif_pos.unsqueeze(0).expand(B, L, 3)
-                    # Pairwise displacement — [B, L, k, 3]
-                    D_pairs_all = query_pos_all.unsqueeze(2) - key_pos_all
-
-                    # Valid mask: keys must be motif — [B, L, k, 1]
-                    key_is_motif_all = is_motif[valid_indices].unsqueeze(-1).float()
-
-                    # Inline sinusoidal distance embedding over [B, L, k]
-                    dist_all = torch.linalg.norm(D_pairs_all, dim=-1)  # [B, L, k]
-                    half_dim = self.motif_pos_embedder.n_freqs
-                    freq = torch.exp(
-                        -math.log(10000.0)
-                        * torch.arange(0, half_dim, dtype=torch.float32, device=device)
-                        / half_dim
-                    )  # [n_freqs]
-                    angles = dist_all.unsqueeze(-1) * freq  # [B, L, k, n_freqs]
-                    sincos = torch.cat(
-                        [torch.sin(angles), torch.cos(angles)], dim=-1
-                    )  # [B, L, k, 2*n_freqs]
-                    motif_pairs = self.motif_pos_embedder.output_proj(sincos)  # [B, L, k, c_atompair]
-                    motif_pairs = motif_pairs * key_is_motif_all
-                    motif_pairs = (
-                        motif_pairs
-                        + self.motif_pos_embedder.process_valid_mask(
-                            key_is_motif_all.to(motif_pairs.dtype)
-                        )
-                        * key_is_motif_all
-                    )
-
-                    # Mask out non-motif query atoms
-                    query_is_motif = is_motif.view(1, L, 1, 1).float()
-                    motif_pairs = motif_pairs * query_is_motif
-
-                    P_LL_sparse += motif_pairs
-
-            with trace_range("RFD3/Memory/ChunkedPairwise/ReferenceEmbedding"):
-                # 2. Reference position embedding — fully vectorized over [B, L, k]
-                if self.ref_pos_embedder is not None and "ref_pos" in f:
-                    ref_pos = f["ref_pos"]  # [L, 3]
-                    ref_space_uid = f["ref_space_uid"]  # [L]
-                    is_motif_seq = f["is_motif_atom_with_fixed_seq"]  # [L]
-
-                    # Gather all key positions at once — [B, L, k, 3]
-                    key_pos_all = ref_pos[valid_indices]
-                    # All query positions — [B, L, 3]
-                    query_pos_all = ref_pos.unsqueeze(0).expand(B, L, 3)
-                    # Pairwise displacement — [B, L, k, 3]
-                    D_pairs_all = query_pos_all.unsqueeze(2) - key_pos_all
-
-                    # Valid mask: same ref_space_uid AND key is motif_seq — [B, L, k, 1]
-                    key_space_uid = ref_space_uid[valid_indices]  # [B, L, k]
-                    query_space_uid = ref_space_uid.view(1, L, 1).expand(B, L, k)  # [B, L, k]
-                    key_is_motif_seq = is_motif_seq[valid_indices]  # [B, L, k]
-                    same_token = key_space_uid == query_space_uid  # [B, L, k]
-                    valid_mask_all = (
-                        (same_token & key_is_motif_seq).unsqueeze(-1).float()
-                    )  # [B, L, k, 1]
-
-                    # Inline position pair distance embedding over [B, L, k]
-                    if self.ref_pos_embedder.embed_frame:
-                        ref_pairs = self.ref_pos_embedder.process_d(D_pairs_all) * valid_mask_all
-                        norm_sq = torch.linalg.norm(D_pairs_all, dim=-1, keepdim=True) ** 2
-                        inv_dist = 1 / (1 + norm_sq)
-                        ref_pairs = (
-                            ref_pairs
-                            + self.ref_pos_embedder.process_inverse_dist(inv_dist)
-                            * valid_mask_all
-                        )
-                        ref_pairs = (
-                            ref_pairs
-                            + self.ref_pos_embedder.process_valid_mask(
-                                valid_mask_all.to(ref_pairs.dtype)
-                            )
-                            * valid_mask_all
-                        )
-                    else:
-                        norm_sq = torch.linalg.norm(D_pairs_all, dim=-1, keepdim=True) ** 2
-                        norm_sq = torch.clamp(norm_sq, min=1e-6)
-                        inv_dist = 1 / (1 + norm_sq)
-                        ref_pairs = (
-                            self.ref_pos_embedder.process_inverse_dist(inv_dist)
-                            * valid_mask_all
-                        )
-                        ref_pairs = (
-                            ref_pairs
-                            + self.ref_pos_embedder.process_valid_mask(
-                                valid_mask_all.to(ref_pairs.dtype)
-                            )
-                            * valid_mask_all
-                        )
-
-                    # Mask out non-motif_seq query atoms
-                    query_is_motif_seq = is_motif_seq.view(1, L, 1, 1).float()
-                    ref_pairs = ref_pairs * query_is_motif_seq
-
-                    P_LL_sparse += ref_pairs
-
-            with trace_range("RFD3/Memory/ChunkedPairwise/SingleFeatureTerms"):
-                # 3. Single embedding terms
-                if self._sl_cached is not None:
-                    # Fast path: MLP already run at tokenisation — just index into the result.
-                    # sl_cached [L, c_atompair]: query atom l always maps to row l.
-                    single_l = self._sl_cached.unsqueeze(0).unsqueeze(2).expand(B, -1, k, -1)
-                    # sm_cached [L, c_atompair]: key atoms are given by valid_indices [B, L, k].
-                    single_m = self._sm_cached[valid_indices]  # [B, L, k, c_atompair]
-                else:
-                    # Slow path (no cache): run the MLPs over the raw atom features.
-                    if C_L.shape[0] != B:
-                        C_L = C_L.expand(B, -1, -1)  # [B, L, c_token]
-                    C_L_queries = C_L.unsqueeze(2).expand(-1, -1, k, -1)  # [B, L, k, c_token]
-                    C_L_keys = torch.gather(
-                        C_L_queries,
-                        1,
-                        valid_indices.unsqueeze(-1).expand(-1, -1, -1, C_L.shape[-1]),
-                    )  # [B, L, k, c_token]
-                    single_l = self.process_single_l(C_L_queries)  # [B, L, k, c_atompair]
-                    single_m = self.process_single_m(C_L_keys)  # [B, L, k, c_atompair]
-                P_LL_sparse += single_l + single_m
-
-            with trace_range("RFD3/Memory/ChunkedPairwise/TokenPairTerms"):
-                # 4. Token pair features Z_init_II
-                # Map atoms to tokens and gather token pair features.
-                if tok_idx.dim() == 1:  # [L] - add batch dimension for consistency
-                    tok_idx_expanded = tok_idx.unsqueeze(0)  # [1, L]
-                else:
-                    tok_idx_expanded = tok_idx
-
-                if tok_idx_expanded.shape[0] != B:
-                    tok_idx_expanded = tok_idx_expanded.expand(B, -1)  # [B, L]
-                tok_queries = tok_idx_expanded.unsqueeze(2).expand(-1, -1, k)  # [B, L, k]
-                tok_keys = torch.gather(tok_queries, 1, valid_indices)  # [B, L, k]
-
-                if self._Z_proc_cached is not None:
-                    # Fast path: process_z already run at tokenisation.
-                    Z_processed = self._Z_proc_cached  # [I, I, c_atompair]
-                else:
-                    # Slow path: run the MLP over the token-pair matrix.
-                    Z_processed = self.process_z(Z_init_II)  # [I, I, c_atompair]
-
-                I_z, I_z2 = Z_processed.shape[:2]
-                Z_pairs_processed = torch.zeros(
-                    B, L, k, self.c_atompair, device=device, dtype=Z_processed.dtype
-                )
-                for b in range(B):
-                    tq = torch.clamp(tok_queries[b], 0, I_z - 1)  # [L, k]
-                    tk = torch.clamp(tok_keys[b], 0, I_z2 - 1)  # [L, k]
-                    Z_pairs_processed[b] = Z_processed[tq, tk]  # [L, k, c_atompair]
-
-                P_LL_sparse += Z_pairs_processed
-
+            # --- 5. Final pair MLP (kept outside compile for tracing) ---
             with trace_range("RFD3/Memory/ChunkedPairwise/FinalPairMLP"):
-                # 5. Final MLP - ADD the result, don't replace (to match standard implementation)
                 P_LL_sparse = P_LL_sparse + self.pair_mlp(P_LL_sparse)
 
             return P_LL_sparse.contiguous()
@@ -445,13 +453,13 @@ class ChunkedPairwiseEmbedder:
             Z_init_II: Token-level pair features [I, I, c_z]
             tok_idx:   Atom-to-token mapping [L]
             use_loop:  If True (default), use original looped implementation.
-                       If False, use vectorized implementation.
+                       If False, use torch.compile'd implementation.
 
         Returns:
             P_LL_sparse: Sparse pairwise features [B, L, k, c_atompair]
         """
         if not use_loop:
-            return self._forward_chunked_vectorized(f, indices, C_L, Z_init_II, tok_idx)
+            return self._forward_chunked_compiled(f, indices, C_L, Z_init_II, tok_idx)
 
         with trace_range("RFD3/Memory/ChunkedPairwise/ForwardChunked"):
             B, L, k = indices.shape
@@ -651,27 +659,17 @@ def test_forward_chunked_correctness():
         out_loop = embedder.forward_chunked(
             f, indices, C_L, Z_init_II, tok_idx, use_loop=True
         )
-        out_vec = embedder.forward_chunked(
+        out_compiled = embedder.forward_chunked(
             f, indices, C_L, Z_init_II, tok_idx, use_loop=False
         )
 
-    max_diff = (out_loop - out_vec).abs().max().item()
+    max_diff = (out_loop - out_compiled).abs().max().item()
     if max_diff < 1e-5:
-        print(f"PASS — max abs diff = {max_diff:.2e}")
+        print(f"PASS — compiled max diff = {max_diff:.2e}")
     else:
-        print(f"FAIL — max abs diff = {max_diff:.2e}")
-        diff = (out_loop - out_vec).abs()
-        flat_idx = diff.argmax()
-        coords = []
-        for dim_size in reversed(diff.shape):
-            coords.append(flat_idx % dim_size)
-            flat_idx = flat_idx // dim_size
-        coords.reverse()
-        print(f"  worst at index {[c.item() for c in coords]}")
-        print(f"  looped  = {out_loop.flatten()[diff.argmax()].item():.6f}")
-        print(f"  vector  = {out_vec.flatten()[diff.argmax()].item():.6f}")
+        print(f"FAIL — compiled max diff = {max_diff:.2e}")
 
-    assert max_diff < 1e-5, f"Outputs differ by {max_diff:.2e}"
+    assert max_diff < 1e-5, f"Compiled outputs differ by {max_diff:.2e}"
 
     # --- Speed benchmark ---
     def _bench(embed, feat, idx, cl, zii, ti, use_loop, n_warmup=3, n_iters=20):
@@ -702,12 +700,12 @@ def test_forward_chunked_correctness():
         }
         n_w, n_i = (2, 5) if bench_L >= 2048 else (3, 20)
         t_loop = _bench(embedder, b_f, b_indices, b_C_L, Z_init_II, b_tok_idx, True, n_w, n_i)
-        t_vec = _bench(embedder, b_f, b_indices, b_C_L, Z_init_II, b_tok_idx, False, n_w, n_i)
-        speedup = t_loop / t_vec if t_vec > 0 else float("inf")
+        # Extra warmup iterations for torch.compile tracing
+        t_compiled = _bench(embedder, b_f, b_indices, b_C_L, Z_init_II, b_tok_idx, False, max(n_w, 3), n_i)
+        speedup = t_loop / t_compiled if t_compiled > 0 else float("inf")
         print(f"\n[L={bench_L}]")
-        print(f"  Looped:     {t_loop*1000:.2f} ms")
-        print(f"  Vectorized: {t_vec*1000:.2f} ms")
-        print(f"  Speedup:    {speedup:.1f}x")
+        print(f"  Looped:   {t_loop*1000:.2f} ms")
+        print(f"  Compiled: {t_compiled*1000:.2f} ms  ({speedup:.1f}x)")
 
     return max_diff
 
