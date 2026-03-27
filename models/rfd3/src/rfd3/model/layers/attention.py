@@ -285,6 +285,7 @@ class LocalAttentionPairBias(nn.Module):
                         C_L=initializer_outputs["C_L"],
                         Z_init_II=initializer_outputs["Z_II"],
                         tok_idx=f["atom_to_token_map"],
+                        use_loop=False,
                     )
                 # P_LL_sparse is already in sparse format [D, L, k, c_pair]
                 use_sparse_pll = True
