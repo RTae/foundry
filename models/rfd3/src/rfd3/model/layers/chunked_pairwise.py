@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from rfd3.model.layers.blocks import PositionPairDistEmbedder, SinusoidalDistEmbed
 from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
 from rfd3.utils.tracing import trace_range
@@ -24,8 +25,8 @@ def _chunked_pairwise_compute(
     motif_pos: torch.Tensor,        # [L, 3]
     is_motif: torch.Tensor,         # [L] bool
     has_motif: bool,
-    motif_output_proj_weight: torch.Tensor,   # [2*n_freqs, c_atompair]
-    motif_valid_mask_weight: torch.Tensor,    # [1, c_atompair]
+    motif_output_proj_weight: torch.Tensor,   # [c_atompair, 2*n_freqs]
+    motif_valid_mask_weight: torch.Tensor,    # [c_atompair, 1]
     motif_n_freqs: int,
     # Ref inputs (may be zero-length dummies if no ref)
     ref_pos: torch.Tensor,          # [L, 3]
@@ -33,9 +34,9 @@ def _chunked_pairwise_compute(
     is_motif_seq: torch.Tensor,     # [L] bool
     has_ref: bool,
     ref_embed_frame: bool,
-    ref_process_d_weight: torch.Tensor,       # [3, c_atompair]
-    ref_inv_dist_weight: torch.Tensor,        # [1, c_atompair]
-    ref_valid_mask_weight: torch.Tensor,      # [1, c_atompair]
+    ref_process_d_weight: torch.Tensor,       # [c_atompair, 3]
+    ref_inv_dist_weight: torch.Tensor,        # [c_atompair, 1]
+    ref_valid_mask_weight: torch.Tensor,      # [c_atompair, 1]
     # Single feature inputs
     sl_cached: Optional[torch.Tensor],        # [L, c_atompair] or None
     sm_cached: Optional[torch.Tensor],        # [L, c_atompair] or None
@@ -71,15 +72,15 @@ def _chunked_pairwise_compute(
         )
         angles = dist_all.unsqueeze(-1) * freq                          # [B, L, k, n_freqs]
         sincos = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-        # Linear projection via matmul (output_proj is linearNoBias)
-        motif_pairs = torch.matmul(sincos, motif_output_proj_weight)     # [B, L, k, c_atompair]
+        # Linear projection via F.linear (matches nn.Linear CUDA path under autocast)
+        motif_pairs = F.linear(sincos, motif_output_proj_weight)         # [B, L, k, c_atompair]
         motif_pairs = motif_pairs * key_is_motif_all
         motif_pairs = (
             motif_pairs
-            + torch.matmul(key_is_motif_all, motif_valid_mask_weight) * key_is_motif_all
+            + F.linear(key_is_motif_all, motif_valid_mask_weight) * key_is_motif_all
         )
         query_is_motif = is_motif.view(1, L, 1, 1).float()
-        P_LL_sparse = P_LL_sparse + motif_pairs * query_is_motif
+        P_LL_sparse += motif_pairs * query_is_motif
 
     # --- 2. Reference position pair dist embedding ---
     if has_ref:
@@ -94,32 +95,32 @@ def _chunked_pairwise_compute(
         valid_mask_all = (same_token & key_is_motif_seq).unsqueeze(-1).float()
 
         if ref_embed_frame:
-            ref_pairs = torch.matmul(D_pairs_all, ref_process_d_weight) * valid_mask_all
+            ref_pairs = F.linear(D_pairs_all, ref_process_d_weight) * valid_mask_all
             norm_sq = torch.linalg.norm(D_pairs_all, dim=-1, keepdim=True) ** 2
             inv_dist = 1 / (1 + norm_sq)
-            ref_pairs = ref_pairs + torch.matmul(inv_dist, ref_inv_dist_weight) * valid_mask_all
+            ref_pairs = ref_pairs + F.linear(inv_dist, ref_inv_dist_weight) * valid_mask_all
             ref_pairs = (
                 ref_pairs
-                + torch.matmul(valid_mask_all, ref_valid_mask_weight) * valid_mask_all
+                + F.linear(valid_mask_all, ref_valid_mask_weight) * valid_mask_all
             )
         else:
             norm_sq = torch.linalg.norm(D_pairs_all, dim=-1, keepdim=True) ** 2
             norm_sq = torch.clamp(norm_sq, min=1e-6)
             inv_dist = 1 / (1 + norm_sq)
-            ref_pairs = torch.matmul(inv_dist, ref_inv_dist_weight) * valid_mask_all
+            ref_pairs = F.linear(inv_dist, ref_inv_dist_weight) * valid_mask_all
             ref_pairs = (
                 ref_pairs
-                + torch.matmul(valid_mask_all, ref_valid_mask_weight) * valid_mask_all
+                + F.linear(valid_mask_all, ref_valid_mask_weight) * valid_mask_all
             )
 
         query_is_motif_seq = is_motif_seq.view(1, L, 1, 1).float()
-        P_LL_sparse = P_LL_sparse + ref_pairs * query_is_motif_seq
+        P_LL_sparse += ref_pairs * query_is_motif_seq
 
     # --- 3. Single feature terms (cached path only) ---
     if sl_cached is not None and sm_cached is not None:
         single_l = sl_cached.unsqueeze(0).unsqueeze(2).expand(B, -1, k, -1)
         single_m = sm_cached[valid_indices]
-        P_LL_sparse = P_LL_sparse + single_l + single_m
+        P_LL_sparse = P_LL_sparse + (single_l + single_m)
 
     # --- 4. Token pair features ---
     tok_idx_expanded = tok_idx.unsqueeze(0).expand(B, L)
@@ -375,12 +376,12 @@ class ChunkedPairwiseEmbedder:
             motif_pos = f.get("motif_pos", dummy3) if has_motif else dummy3
             is_motif = f.get("is_motif_atom_with_fixed_coord", dummy1) if has_motif else dummy1
             if has_motif:
-                motif_out_w = self.motif_pos_embedder.output_proj.weight.t()       # [2*n_freqs, c_atompair]
-                motif_vm_w = self.motif_pos_embedder.process_valid_mask.weight.t()  # [1, c_atompair]
+                motif_out_w = self.motif_pos_embedder.output_proj.weight           # [c_atompair, 2*n_freqs]
+                motif_vm_w = self.motif_pos_embedder.process_valid_mask.weight      # [c_atompair, 1]
                 motif_n_freqs = self.motif_pos_embedder.n_freqs
             else:
-                motif_out_w = torch.zeros(1, self.c_atompair, device=device, dtype=C_L.dtype)
-                motif_vm_w = torch.zeros(1, self.c_atompair, device=device, dtype=C_L.dtype)
+                motif_out_w = torch.zeros(self.c_atompair, 1, device=device, dtype=C_L.dtype)
+                motif_vm_w = torch.zeros(self.c_atompair, 1, device=device, dtype=C_L.dtype)
                 motif_n_freqs = 1
 
             # Ref args
@@ -389,14 +390,14 @@ class ChunkedPairwiseEmbedder:
             is_motif_seq = f.get("is_motif_atom_with_fixed_seq", dummy1) if has_ref else dummy1
             if has_ref:
                 ref_embed_frame = self.ref_pos_embedder.embed_frame
-                ref_d_w = self.ref_pos_embedder.process_d.weight.t() if ref_embed_frame else torch.zeros(3, self.c_atompair, device=device, dtype=C_L.dtype)
-                ref_inv_w = self.ref_pos_embedder.process_inverse_dist.weight.t()
-                ref_vm_w = self.ref_pos_embedder.process_valid_mask.weight.t()
+                ref_d_w = self.ref_pos_embedder.process_d.weight if (ref_embed_frame and hasattr(self.ref_pos_embedder, 'process_d')) else torch.zeros(self.c_atompair, 3, device=device, dtype=C_L.dtype)
+                ref_inv_w = self.ref_pos_embedder.process_inverse_dist.weight
+                ref_vm_w = self.ref_pos_embedder.process_valid_mask.weight
             else:
                 ref_embed_frame = True
-                ref_d_w = torch.zeros(3, self.c_atompair, device=device, dtype=C_L.dtype)
-                ref_inv_w = torch.zeros(1, self.c_atompair, device=device, dtype=C_L.dtype)
-                ref_vm_w = torch.zeros(1, self.c_atompair, device=device, dtype=C_L.dtype)
+                ref_d_w = torch.zeros(self.c_atompair, 3, device=device, dtype=C_L.dtype)
+                ref_inv_w = torch.zeros(self.c_atompair, 1, device=device, dtype=C_L.dtype)
+                ref_vm_w = torch.zeros(self.c_atompair, 1, device=device, dtype=C_L.dtype)
 
             # Single feature terms — ensure they're always populated
             if self._sl_cached is not None:
