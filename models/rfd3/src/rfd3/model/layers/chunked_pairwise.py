@@ -358,8 +358,9 @@ class ChunkedPairwiseEmbedder:
         C_L: torch.Tensor,
         Z_init_II: torch.Tensor,
         tok_idx: torch.Tensor,
+        use_compile: bool = True,
     ) -> torch.Tensor:
-        """Compiled implementation — vectorized ops fused via torch.compile."""
+        """Vectorized implementation — optionally fused via torch.compile."""
         with trace_range("RFD3/Memory/ChunkedPairwise/ForwardChunkedCompiled"):
             # --- Prepare inputs ---
             if C_L.dim() == 2:
@@ -414,7 +415,8 @@ class ChunkedPairwiseEmbedder:
                 Z_processed = self.process_z(Z_init_II)
 
             # --- Call core compute ---
-            P_LL_sparse = _get_compiled_compute()(
+            compute_fn = _get_compiled_compute() if use_compile else _chunked_pairwise_compute
+            P_LL_sparse = compute_fn(
                 indices, C_L, self.c_atompair,
                 motif_pos, is_motif, has_motif,
                 motif_out_w, motif_vm_w, motif_n_freqs,
@@ -438,6 +440,7 @@ class ChunkedPairwiseEmbedder:
         Z_init_II: torch.Tensor,  # [I, I, c_z] - token pair features
         tok_idx: torch.Tensor,  # [L] - atom to token mapping
         use_loop: bool = True,
+        use_compile: bool = False,
     ) -> torch.Tensor:
         """
         Compute P_LL only for the pairs specified by attention indices.
@@ -454,13 +457,15 @@ class ChunkedPairwiseEmbedder:
             Z_init_II: Token-level pair features [I, I, c_z]
             tok_idx:   Atom-to-token mapping [L]
             use_loop:  If True (default), use original looped implementation.
-                       If False, use torch.compile'd implementation.
+                       If False, use vectorized implementation.
+            use_compile: If True, use torch.compile on the vectorized path
+                         (only applies when use_loop=False).
 
         Returns:
             P_LL_sparse: Sparse pairwise features [B, L, k, c_atompair]
         """
         if not use_loop:
-            return self._forward_chunked_compiled(f, indices, C_L, Z_init_II, tok_idx)
+            return self._forward_chunked_compiled(f, indices, C_L, Z_init_II, tok_idx, use_compile=use_compile)
 
         with trace_range("RFD3/Memory/ChunkedPairwise/ForwardChunked"):
             B, L, k = indices.shape
