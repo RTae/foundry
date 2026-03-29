@@ -277,7 +277,7 @@ def main():
 
     from matplotlib.colors import ListedColormap
     # Teal for window, bright magenta for KNN — maximally contrasting
-    cmap = ListedColormap(["#F0F0F0", "#E53935", "#009688"])  # 0=unused, 1=KNN(red), 2=window(teal)
+    cmap = ListedColormap(["#F0F0F0", "#FF9800", "#4CAF50"])  # 0=unused, 1=KNN(orange), 2=window(green)
     
     ax1 = fig.add_axes([0.05, 0.06, 0.40, 0.42])
     ax2 = fig.add_axes([0.52, 0.06, 0.46, 0.42])
@@ -298,8 +298,8 @@ def main():
     
     patches1 = [
         mpatches.Patch(color="#F0F0F0", label="Computed but unused"),
-        mpatches.Patch(color="#009688", label="Window neighbors"),
-        mpatches.Patch(color="#E53935", label="KNN neighbors"),
+        mpatches.Patch(color="#4CAF50", label="Window neighbors"),
+        mpatches.Patch(color="#FF9800", label="KNN neighbors"),
     ]
     ax1.legend(handles=patches1, loc="lower right", fontsize=7, framealpha=0.9)
     
@@ -343,8 +343,8 @@ def main():
     ax2.plot(zoom_n_window, np.arange(block_size), color="black", linewidth=2, alpha=0.8)
     
     patches2 = [
-        mpatches.Patch(color="#009688", label="Window neighbors"),
-        mpatches.Patch(color="#E53935", label="KNN neighbors"),
+        mpatches.Patch(color="#4CAF50", label="Window neighbors"),
+        mpatches.Patch(color="#FF9800", label="KNN neighbors"),
     ]
     ax2.legend(handles=patches2, loc="lower right", fontsize=7, framealpha=0.9)
     
