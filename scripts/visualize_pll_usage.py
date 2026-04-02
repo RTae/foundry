@@ -264,7 +264,7 @@ def main():
 
     # --- Row 2: Heatmaps ---
     # For visualization, downsample if L is large
-    L_viz = min(L, 600)
+    L_viz = min(L, 200)
     if L_viz < L:
         step = L // L_viz
         indices_viz = indices[::step]
@@ -277,18 +277,22 @@ def main():
 
     from matplotlib.colors import ListedColormap
     # Teal for window, bright magenta for KNN — maximally contrasting
-    cmap = ListedColormap(["#F0F0F0", "#FF9800", "#4CAF50"])  # 0=unused, 1=KNN(orange), 2=window(green)
+    cmap = ListedColormap(["#F0F0F0", "#4CAF50", "#FF9800"])  # 0=unused, 1=KNN(green), 2=window(orange)
     
     ax1 = fig.add_axes([0.05, 0.06, 0.40, 0.42])
     ax2 = fig.add_axes([0.52, 0.06, 0.46, 0.42])
     
-    # --- Panel 1: Full L×L matrix ---
-    full_map = np.zeros((L_viz, L), dtype=np.uint8)
+    # --- Panel 1: Full L×L matrix (downsampled to L_viz×L_viz) ---
+    L_col = L_viz  # downsample columns to match rows
+    full_map = np.zeros((L_viz, L_col), dtype=np.uint8)
     for i in range(L_viz):
         for j_idx in range(k):
             j = indices_viz[i, j_idx].item()
-            if 0 <= j < L:
-                full_map[i, j] = 2 if is_window_viz[i, j_idx] else 1
+            j_ds = j // step if L_viz < L else j
+            if 0 <= j_ds < L_col:
+                val = 2 if is_window_viz[i, j_idx] else 1
+                if full_map[i, j_ds] < val:  # window over KNN over unused
+                    full_map[i, j_ds] = val
     
     ax1.imshow(full_map, cmap=cmap, aspect="auto", interpolation="nearest", vmin=0, vmax=2)
     ax1.set_title("High Memory: full L×L P_LL", 
@@ -298,8 +302,8 @@ def main():
     
     patches1 = [
         mpatches.Patch(color="#F0F0F0", label="Computed but unused"),
-        mpatches.Patch(color="#4CAF50", label="Window neighbors"),
-        mpatches.Patch(color="#FF9800", label="KNN neighbors"),
+        mpatches.Patch(color="#FF9800", label="Window neighbors"),
+        mpatches.Patch(color="#4CAF50", label="KNN neighbors"),
     ]
     ax1.legend(handles=patches1, loc="lower right", fontsize=7, framealpha=0.9)
     
@@ -343,8 +347,8 @@ def main():
     ax2.plot(zoom_n_window, np.arange(block_size), color="black", linewidth=2, alpha=0.8)
     
     patches2 = [
-        mpatches.Patch(color="#4CAF50", label="Window neighbors"),
-        mpatches.Patch(color="#FF9800", label="KNN neighbors"),
+        mpatches.Patch(color="#FF9800", label="Window neighbors"),
+        mpatches.Patch(color="#4CAF50", label="KNN neighbors"),
     ]
     ax2.legend(handles=patches2, loc="lower right", fontsize=7, framealpha=0.9)
     

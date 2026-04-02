@@ -50,22 +50,30 @@ def main():
     sort_idx = np.argsort(n_window)
     win_sorted = n_window[sort_idx]
     knn_sorted = n_knn[sort_idx]
-    x = np.arange(L)
+
+    # Downsample to at most 200 atoms for readability
+    max_bars = 200
+    if L > max_bars:
+        step = L // max_bars
+        win_sorted = win_sorted[::step]
+        knn_sorted = knn_sorted[::step]
+    L_viz = len(win_sorted)
+    x = np.arange(L_viz)
 
     # Panel 1: stacked bar — each atom shows its window (bottom) + KNN (top)
-    ax_bar.bar(x, win_sorted, width=1.0, color="#4CAF50", label="Window")
-    ax_bar.bar(x, knn_sorted, width=1.0, bottom=win_sorted, color="#FF9800", label="KNN")
+    ax_bar.bar(x, win_sorted, width=1.0, color="#FF9800", label="Window")
+    ax_bar.bar(x, knn_sorted, width=1.0, bottom=win_sorted, color="#4CAF50", label="KNN")
     ax_bar.axhline(k, color="black", linewidth=0.5, alpha=0.3)
 
     mean_win = n_window.mean()
     ax_bar.axhline(mean_win, color="black", linestyle="--", linewidth=1.5,
                    label=f"Mean window = {mean_win:.0f} ({mean_win/k*100:.0f}%)")
 
-    ax_bar.set_xlabel("Atoms (sorted by window count)", fontsize=11)
+    ax_bar.set_xlabel(f"Atoms (sorted by window count, {L_viz} of {L} shown)", fontsize=11)
     ax_bar.set_ylabel(f"Number of neighbors (k={k})", fontsize=11)
     ax_bar.set_title("Per atom neighbor composition", fontsize=13, fontweight="bold")
     ax_bar.legend(fontsize=9, loc="upper left")
-    ax_bar.set_xlim(0, L)
+    ax_bar.set_xlim(0, L_viz)
     ax_bar.set_ylim(0, k + 5)
 
     # Panel 2: histogram of window %
